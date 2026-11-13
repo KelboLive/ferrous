@@ -663,6 +663,99 @@ impl SceneCollection {
         }
     }
 
+    /// Where `id` lives: (scene index, item index).
+    fn locate(&self, id: u64) -> Option<(usize, usize)> {
+        self.scenes.iter().enumerate().find_map(|(si, sc)| sc.items.iter().position(|i| i.id == id).map(|ii| (si, ii)))
+    }
+
+    /// The source a clone of `id` should point at: `id` itself, or, when
+    /// `id` is already a clone, what it clones (clones of clones show nothing).
+    fn clone_target(&self, id: u64) -> Option<u64> {
+        let (si, ii) = self.locate(id)?;
+        Some(match &self.scenes[si].items[ii].source {
+            SourceConfig::Clone { source } => *source,
+            _ => id,
+        })
+    }
+
+    /// Adds, right above `id` in `scene`, a Source Clone showing the same
+    /// picture with the same layout. Duplicating without opening the
+    /// capture a second time (a webcam can't be opened twice).
+    pub fn duplicate_item(&mut self, scene: usize, id: u64) -> Option<u64> {
+        let target = self.clone_target(id)?;
+        let scene = scene.min(self.scenes.len() - 1);
+        let at = self.scenes[scene].items.iter().position(|i| i.id == id)?;
+        let new_id = self.alloc_id();
+        let src = &self.scenes[scene].items[at];
+        let mut item = src.clone();
+        item.id = new_id;
+        item.name = format!("{} copy", src.name);
+        item.source = SourceConfig::Clone { source: target };
+        item.video_filters = Default::default();
+        item.audio_filters = Default::default();
+        item.audio_muted = true;
+        item.pending_layout = None;
+        self.scenes[scene].items.insert(at + 1, item);
+        if let Some(p) = self.scenes[scene].vertical.iter().find(|p| p.item_id == id).cloned() {
+            self.scenes[scene].vertical.push(VerticalPlacement { item_id: new_id, ..p });
+        }
+        Some(new_id)
+    }
+
+    /// Copies a scene with its layout. Captures (screens, cameras, browsers,
+    /// plugins) become clones of the originals so nothing is opened twice;
+    /// images, colours, text and the like are copied outright.
+    pub fn duplicate_scene(&mut self, index: usize) -> Option<usize> {
+        let mut copy = self.scenes.get(index)?.clone();
+        copy.name = format!("{} copy", copy.name);
+        let mut remap = Vec::new();
+        for item in &mut copy.items {
+            let old = item.id;
+            item.id = self.alloc_id();
+            remap.push((old, item.id));
+            let live = matches!(
+                item.source,
+                SourceConfig::DisplayCapture { .. }
+                    | SourceConfig::WindowCapture { .. }
+                    | SourceConfig::GameCapture { .. }
+                    | SourceConfig::VideoDevice { .. }
+                    | SourceConfig::Browser { .. }
+                    | SourceConfig::LinkReceiver { .. }
+                    | SourceConfig::Plugin { .. }
+                    | SourceConfig::ObsPlugin { .. }
+            );
+            if live {
+                item.source = SourceConfig::Clone { source: old };
+                item.audio_muted = true;
+            }
+        }
+        for p in &mut copy.vertical {
+            if let Some((_, new)) = remap.iter().find(|(o, _)| *o == p.item_id) {
+                p.item_id = *new;
+            }
+        }
+        let at = index + 1;
+        self.scenes.insert(at, copy);
+        if self.current >= at {
+            self.current += 1;
+        }
+        Some(at)
+    }
+
+    /// Moves a scene up (-1) or down (+1) the list; returns its new index.
+    pub fn move_scene(&mut self, index: usize, delta: isize) -> Option<usize> {
+        let to = index.checked_add_signed(delta).filter(|t| *t < self.scenes.len() && index < self.scenes.len())?;
+        let was_current = self.current == index;
+        let other_current = self.current == to;
+        self.scenes.swap(index, to);
+        if was_current {
+            self.current = to;
+        } else if other_current {
+            self.current = index;
+        }
+        Some(to)
+    }
+
     pub fn add_item(&mut self, name: impl Into<String>, source: SourceConfig) -> u64 {
         let cur = self.current;
         self.add_item_to(cur, name, source)
@@ -835,5 +928,58 @@ mod rotation_tests {
         let r = rot.drag_handle(400, 200, (1.0, 0.5), (-50.0, 0.0), HandleDrag::Crop);
         assert!(r.crop[2] > 0);
         assert!(near(r.point(400, 200, 0.0, 0.5), rot.point(400, 200, 0.0, 0.5)));
+    }
+
+    #[test]
+    fn duplicating_an_item_clones_it_instead_of_reopening_the_capture() {
+        let mut c = SceneCollection::default();
+        let cam = c.add_item("Cam", SourceConfig::VideoDevice { device: "x".into(), resolution: None, fps: None, audio_device: None });
+        let copy = c.duplicate_item(0, cam).unwrap();
+        let it = c.scenes[0].items.iter().find(|i| i.id == copy).unwrap();
+        assert_eq!(it.source, SourceConfig::Clone { source: cam });
+        assert_eq!(it.name, "Cam copy");
+        // A copy of a copy points at the original.
+        let again = c.duplicate_item(0, copy).unwrap();
+        let it = c.scenes[0].items.iter().find(|i| i.id == again).unwrap();
+        assert_eq!(it.source, SourceConfig::Clone { source: cam });
+        assert!(c.duplicate_item(0, 9999).is_none());
+    }
+
+    #[test]
+    fn duplicating_a_scene_keeps_cheap_sources_and_clones_captures() {
+        let mut c = SceneCollection::default();
+        let n = c.scenes[0].items.len();
+        let color = c.add_item("Bg", SourceConfig::Color { bgra: [1, 2, 3, 255], width: 8, height: 8 });
+        let disp = c.add_item("Screen", SourceConfig::DisplayCapture { monitor_index: 0, capture_cursor: true });
+        let at = c.duplicate_scene(0).unwrap();
+        assert_eq!(at, 1);
+        assert_eq!(c.scenes.len(), 2);
+        let copy = &c.scenes[1];
+        assert_eq!(copy.name, format!("{} copy", c.scenes[0].name));
+        assert_eq!(copy.items.len(), n + 2);
+        let mut ids: Vec<u64> = c.scenes.iter().flat_map(|s| s.items.iter().map(|i| i.id)).collect();
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "ids must stay unique across scenes");
+        assert!(matches!(copy.items[n].source, SourceConfig::Color { .. }));
+        assert_eq!(copy.items[n + 1].source, SourceConfig::Clone { source: disp });
+        let _ = color;
+    }
+
+    #[test]
+    fn moving_a_scene_keeps_the_current_one_current() {
+        let mut c = SceneCollection::default();
+        c.add_scene("B");
+        c.add_scene("C");
+        c.current = 0;
+        assert_eq!(c.move_scene(0, 1), Some(1));
+        assert_eq!(c.current, 1);
+        assert_eq!(c.scenes[1].name, "Scene");
+        assert_eq!(c.move_scene(2, 1), None);
+        assert_eq!(c.move_scene(0, -1), None);
+        c.current = 2;
+        c.move_scene(0, 1);
+        assert_eq!(c.current, 2);
     }
 }

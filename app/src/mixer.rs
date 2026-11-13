@@ -153,7 +153,24 @@ fn span(rect: Rect, vertical: bool, t0: f32, t1: f32) -> Rect {
 const ZONES: [(f32, f32); 3] = [(MIN_DB, -20.0), (-20.0, -9.0), (-9.0, 0.0)];
 
 fn zone_color(i: usize) -> Color32 {
+    if theme::patterns() {
+        // Okabe–Ito: bluish green, yellow, vermillion. Distinct for the
+        // common kinds of colour blindness, and the zones are hatched too.
+        return [Color32::from_rgb(0x00, 0x9e, 0x73), Color32::from_rgb(0xf0, 0xe4, 0x42), Color32::from_rgb(0xd5, 0x5e, 0x00)][i];
+    }
     [theme::ok(), theme::warn(), theme::live()][i]
+}
+
+/// Diagonal hatching over `rect`, `step` points apart.
+fn hatch(p: &egui::Painter, rect: Rect, step: f32) {
+    let p = p.with_clip_rect(rect);
+    let stroke = Stroke::new(1.0, Color32::from_black_alpha(120));
+    let span = rect.width() + rect.height();
+    let mut d = 0.0;
+    while d < span {
+        p.line_segment([Pos2::new(rect.left() + d, rect.top()), Pos2::new(rect.left() + d - rect.height(), rect.bottom())], stroke);
+        d += step;
+    }
 }
 
 fn grey(c: Color32, t: f32) -> Color32 {
@@ -187,9 +204,16 @@ fn bar(p: &egui::Painter, rect: Rect, vertical: bool, peak: f32, rms: f32, hold:
             p.rect_filled(span(rect, vertical, ta, tr), 0, c);
         }
     }
+    if theme::patterns() {
+        // Loud zones are marked by texture, not just colour: sparse hatching
+        // for “getting loud”, dense for “too loud”.
+        for (i, (a, b)) in ZONES.iter().enumerate().skip(1) {
+            hatch(p, span(rect, vertical, db_to_meter(*a), db_to_meter(*b)), if i == 1 { 7.0 } else { 3.5 });
+        }
+    }
     if active && hold > MIN_DB + 0.5 {
         let t = db_to_meter(hold);
-        let c = grey(if hold >= -9.0 { theme::live() } else if hold >= -20.0 { theme::warn() } else { theme::ok() }, mute_t);
+        let c = grey(zone_color(if hold >= -9.0 { 2 } else if hold >= -20.0 { 1 } else { 0 }), mute_t);
         let a = along(rect, vertical, t, 0.0);
         let b = along(rect, vertical, t, 1.0);
         let w = if vertical { Vec2::new(0.0, 1.0) } else { Vec2::new(1.0, 0.0) };

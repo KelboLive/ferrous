@@ -61,21 +61,21 @@ your hardware can produce.** In practice that means:
 | **Presets** | **Recording presets** (built-in and your own) and a **speed/quality benchmark** that ranks settings for your PC |
 | **Setup** | First-run **benchmark** (encoders, compositor, upload, ingest-server ranking) with separate streaming and recording recommendations; quick auto-config wizard |
 | **Organisation** | Profiles, scene collections, **OBS scene-collection import** |
+| **Ease of use** | **Simple mode** by default (switch to Advanced any time), empty-state tiles and scene templates, a **pre-flight check** before recording or going live, plain-language errors with fix buttons, Undo toasts, a **Ctrl+K command palette**, a first-run tour and troubleshooting page; accessibility: interface zoom, high-contrast theme, colour-blind meters, reduce motion |
 | **UI** | Fully modular docks: every card (preview, scenes, sources, mixer, controls, properties, stats, performance, vertical canvas) can be dragged and snapped beside, above, below or into any other dock with a live snap preview, resized, floated, closed and reopened; layout presets, named saved layouts and a layout lock; **custom browser docks** (chat, alerts, activity feeds as live pages, like OBS); **Stats** dock (choose your stats); **Performance Monitor** (per-source CPU/GPU with graphs); layout remembered between sessions |
 
 ## Screenshots
 
-The benchmark shots were taken on a slow shared CPU rendering a deliberately heavy test scene, so nothing there keeps up in real time. On a real gaming PC with hardware encoders the speeds are far higher.
+All taken from the current build, on a software-rendered virtual display (so the preview is black and there are no audio devices). Everything shown is the real interface.
 
 | | |
 |---|---|
-| ![Main window](docs/screenshots/01-main-window-stats-performance.png) Main window with the Stats and Performance docks | ![Studio mode](docs/screenshots/05-studio-mode.png) Studio mode |
-| ![Add source](docs/screenshots/03-add-source-menu.png) Adding a source | ![Filters](docs/screenshots/04-filters-and-audio-channel.png) Filters and audio channel |
-| ![Mixer](docs/screenshots/20-mixer-animated.png) Animated mixer | ![Rotation](docs/screenshots/22-rotation.png) Rotation |
-| ![Vertical canvas](docs/screenshots/06-vertical-canvas-tiktok-go-live.png) Vertical canvas for TikTok | ![Multistream](docs/screenshots/07-multistream-destinations.png) Multistream destinations |
-| ![Benchmark](docs/screenshots/10-setup-benchmark-results.png) First-run setup benchmark | ![Docks](docs/screenshots/14-dock-tabbed.png) Modular docks |
-| ![Luma wipes](docs/screenshots/23-luma-wipe-picker.png) Luma wipe picker | ![Link](docs/screenshots/08-ferrous-link-settings.png) Ferrous Link |
-| ![Presets](docs/screenshots/25-recording-presets-benchmark.png) Recording presets and benchmark | ![Results](docs/screenshots/26-benchmark-results.png) Benchmark results: speed, bitrate and quality per setting |
+| ![Simple mode](docs/screenshots/02-simple-mode.png) **Simple mode** (the default): scenes, sources, preview, mixer and two big buttons, plus a three-step tour | ![Empty scene](docs/screenshots/03-empty-scene-tiles.png) An empty scene offers big tiles instead of a blank list, and removing something offers Undo |
+| ![Pre-flight](docs/screenshots/04-preflight-check.png) **Pre-flight check**: problems in plain words with one-click fixes | ![Templates](docs/screenshots/05-scene-templates.png) Scene templates: Screen, Just chatting, Gameplay, Tutorial, Starting soon |
+| ![Palette](docs/screenshots/06-command-palette.png) **Ctrl+K** finds any action, scene, source type or setting | ![Advanced](docs/screenshots/10-advanced-mode.png) **Advanced mode**: every dock and menu, one click away |
+| ![General](docs/screenshots/07-settings-general.png) Settings → General: themes and accessibility (interface size, high contrast, colour-blind meters, reduce motion) | ![Recording](docs/screenshots/08-settings-recording.png) Settings → Recording: quality profiles and presets |
+| ![Stream](docs/screenshots/09-settings-stream.png) Settings → Stream, with a live "GB per hour / Mbps needed" hint | ![Source menu](docs/screenshots/12-source-context-menu.png) Source right-click menu |
+| ![Scene menu](docs/screenshots/13-scene-context-menu.png) Scene right-click menu | ![Setup](docs/screenshots/01-first-run-setup.png) First-run setup and benchmark |
 
 ## Architecture
 

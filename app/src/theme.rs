@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use eframe::egui::{self, Color32, CornerRadius, Stroke, Visuals};
 
@@ -61,6 +61,36 @@ static GLASS: AtomicU8 = AtomicU8::new(2);
 /// Animated backdrops: 0 off, 1 reduced, 2 full.
 static MOTION: AtomicU8 = AtomicU8::new(2);
 
+/// Accessibility switches, set every frame from the settings.
+static CONTRAST: AtomicBool = AtomicBool::new(false);
+static PATTERNS: AtomicBool = AtomicBool::new(false);
+static CALM: AtomicBool = AtomicBool::new(false);
+
+/// High-contrast colours are on.
+pub fn high_contrast() -> bool {
+    CONTRAST.load(Ordering::Relaxed)
+}
+
+/// Meters draw hatching and use the colour-blind-safe palette.
+pub fn patterns() -> bool {
+    PATTERNS.load(Ordering::Relaxed)
+}
+
+/// Nothing animates: no backgrounds, no fades.
+pub fn calm() -> bool {
+    CALM.load(Ordering::Relaxed)
+}
+
+/// Applies the accessibility settings; cheap to call every frame.
+pub fn sync_access(ctx: &egui::Context, contrast: bool, patterns: bool, calm: bool) {
+    PATTERNS.store(patterns, Ordering::Relaxed);
+    let changed = CONTRAST.swap(contrast, Ordering::Relaxed) != contrast || CALM.swap(calm, Ordering::Relaxed) != calm;
+    if changed {
+        apply(ctx);
+        ctx.request_repaint();
+    }
+}
+
 fn p() -> &'static Palette {
     &PALETTES[CURRENT.load(Ordering::Relaxed).min(PALETTES.len() - 1)]
 }
@@ -89,37 +119,61 @@ pub fn set_active(active: bool) {
 }
 
 fn motion() -> u8 {
+    if calm() {
+        return 0;
+    }
     if glassy() && ACTIVE.load(Ordering::Relaxed) == 1 { MOTION.load(Ordering::Relaxed) } else { 0 }
 }
 
 /// The panels are glass: the theme has a backdrop and the user hasn't turned it off.
 pub fn glassy() -> bool {
-    p().glass && GLASS.load(Ordering::Relaxed) > 0
+    !high_contrast() && p().glass && GLASS.load(Ordering::Relaxed) > 0
 }
 
 fn full_glass() -> bool {
-    p().glass && GLASS.load(Ordering::Relaxed) >= 2
+    !high_contrast() && p().glass && GLASS.load(Ordering::Relaxed) >= 2
 }
 
 pub fn bg() -> Color32 {
+    if high_contrast() {
+        return Color32::BLACK;
+    }
     p().bg
 }
 pub fn panel() -> Color32 {
+    if high_contrast() {
+        return rgb(0x0a0a0a);
+    }
     p().panel
 }
 pub fn surface() -> Color32 {
+    if high_contrast() {
+        return rgb(0x1c1c1c);
+    }
     p().surface
 }
 pub fn border() -> Color32 {
+    if high_contrast() {
+        return rgb(0xbdbdbd);
+    }
     p().border
 }
 pub fn text() -> Color32 {
+    if high_contrast() {
+        return Color32::WHITE;
+    }
     p().text
 }
 pub fn muted() -> Color32 {
+    if high_contrast() {
+        return rgb(0xd4d4d4);
+    }
     p().muted
 }
 pub fn accent() -> Color32 {
+    if high_contrast() {
+        return p().accent.lerp_to_gamma(Color32::WHITE, 0.25);
+    }
     p().accent
 }
 pub fn accent2() -> Color32 {
@@ -171,8 +225,9 @@ pub fn apply(ctx: &egui::Context) {
     v.window_stroke = Stroke::new(1.0, if glassy() { border().lerp_to_gamma(Color32::WHITE, 0.25) } else { border() });
     v.window_corner_radius = CornerRadius::same(r + 2);
     v.menu_corner_radius = CornerRadius::same(r);
-    v.selection.bg_fill = accent().linear_multiply(0.35);
-    v.selection.stroke = Stroke::new(1.0, accent());
+    v.selection.bg_fill = accent().linear_multiply(if high_contrast() { 0.8 } else { 0.35 });
+    // The keyboard focus ring: thick enough to follow with the eye.
+    v.selection.stroke = Stroke::new(if high_contrast() { 3.0 } else { 2.0 }, accent());
     v.hyperlink_color = accent();
     for w in [
         &mut v.widgets.noninteractive,
@@ -195,6 +250,7 @@ pub fn apply(ctx: &egui::Context) {
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
         s.spacing.button_padding = egui::vec2(10.0, 5.0);
         s.spacing.interact_size.y = 26.0;
+        s.animation_time = if calm() { 0.0 } else { 1.0 / 12.0 };
     });
 }
 

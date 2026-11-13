@@ -538,6 +538,23 @@ pub struct UiSettings {
     pub glass: u8,
     /// Animated theme backgrounds: 0 off, 1 reduced, 2 full.
     pub motion: u8,
+    /// Simple layout: only scenes, sources, preview, mixer and the big
+    /// record / stream buttons. Off = every dock and menu.
+    pub simple_mode: bool,
+    /// The Advanced layout, parked here while Simple mode is on.
+    pub advanced_layout: Option<String>,
+    /// Interface zoom, 0.8 to 2.0.
+    pub ui_scale: f32,
+    /// Black background, white text, strong outlines.
+    pub high_contrast: bool,
+    /// Meters add hatching and a colour-blind-safe palette to the colours.
+    pub meter_patterns: bool,
+    /// No animations anywhere (backgrounds, fades, meter smoothing).
+    pub reduce_motion: bool,
+    /// The first-run tour has been finished or skipped.
+    pub tour_done: bool,
+    /// Check for common problems when Start Recording / Start Streaming is clicked.
+    pub preflight: bool,
 }
 
 /// A custom browser dock: a named dock showing a web page, like OBS's
@@ -562,7 +579,7 @@ pub enum SnapGuides {
 
 impl Default for UiSettings {
     fn default() -> Self {
-        Self { docks: Default::default(), hidden_stats: Vec::new(), recent_sources: Vec::new(), perf_current_scene_only: false, setup_done: false, layout: None, saved_layouts: Default::default(), snap_guides: SnapGuides::Zones, lock_layout: false, mixer_vertical: false, custom_docks: Vec::new(), preview_enabled: true, preview_max_fps: 0, layout_rev: 0, theme: "ember".into(), glass: 2, motion: 1 }
+        Self { docks: Default::default(), hidden_stats: Vec::new(), recent_sources: Vec::new(), perf_current_scene_only: false, setup_done: false, layout: None, saved_layouts: Default::default(), snap_guides: SnapGuides::Zones, lock_layout: false, mixer_vertical: false, custom_docks: Vec::new(), preview_enabled: true, preview_max_fps: 0, layout_rev: 0, theme: "ember".into(), glass: 2, motion: 1, simple_mode: true, advanced_layout: None, ui_scale: 1.0, high_contrast: false, meter_patterns: false, reduce_motion: false, tour_done: false, preflight: true }
     }
 }
 

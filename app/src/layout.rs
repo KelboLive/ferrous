@@ -90,6 +90,9 @@ pub enum Preset {
     Analytics,
     /// Ferrous with the 9:16 canvas beside the preview, for TikTok/Shorts.
     Vertical,
+    /// The Simple mode: the Ferrous layout with room for the big buttons.
+    /// Not offered in the presets menu.
+    Simple,
 }
 
 pub const PRESETS: [Preset; 4] = [Preset::Ferrous, Preset::Classic, Preset::Analytics, Preset::Vertical];
@@ -101,6 +104,7 @@ impl Preset {
             Preset::Classic => "Classic (OBS-style)",
             Preset::Analytics => "Analytics",
             Preset::Vertical => "Vertical / TikTok",
+            Preset::Simple => "Simple",
         }
     }
 
@@ -108,17 +112,18 @@ impl Preset {
         let mut s = DockState::new(vec![Dock::Preview]);
         let t = s.main_surface_mut();
         let root = NodeIndex::root();
+        let controls = if self == Preset::Simple { 0.40 } else { 0.30 };
         let ember = |t: &mut egui_stack::Tree<Dock>| -> NodeIndex {
             let [center, left] = t.split_left(root, 0.19, vec![Dock::Scenes]);
             t.split_below(left, 0.42, vec![Dock::Sources]);
             let [center, right] = t.split_right(center, 0.74, vec![Dock::Controls]);
             // Properties open from a source's right-click menu (as in OBS);
             // the dock is still in View → Docks for anyone who wants it.
-            t.split_below(right, 0.30, vec![Dock::Mixer]);
+            t.split_below(right, controls, vec![Dock::Mixer]);
             center
         };
         match self {
-            Preset::Ferrous => {
+            Preset::Ferrous | Preset::Simple => {
                 ember(t);
             }
             Preset::Classic => {
@@ -158,7 +163,7 @@ impl Layout {
         if let Some(tree) = ui.layout.as_deref().and_then(parse) {
             return Self { tree, anchors: HashMap::new(), saved: ui.layout.clone() };
         }
-        let mut l = Self::from_preset(Preset::Ferrous);
+        let mut l = Self::from_preset(if ui.simple_mode { Preset::Simple } else { Preset::Ferrous });
         // Docks that were never part of the old layout start closed.
         l.close(Dock::Vertical);
         for d in [Dock::Scenes, Dock::Sources, Dock::Controls, Dock::Mixer, Dock::Properties] {
@@ -190,6 +195,14 @@ impl Layout {
             // Properties moved to the sources' right-click menu (as in OBS).
             l.close(Dock::Properties);
             ui.layout_rev = 1;
+        }
+        if ui.layout_rev < 2 {
+            // Simple mode is new: anyone who already arranged their docks
+            // keeps the full interface.
+            if ui.layout.is_some() {
+                ui.simple_mode = false;
+            }
+            ui.layout_rev = 2;
         }
         l
     }
@@ -345,6 +358,9 @@ pub fn keep_layout(old: &UiSettings, new: &mut UiSettings) {
     new.preview_enabled = old.preview_enabled;
     new.preview_max_fps = old.preview_max_fps;
     new.layout_rev = old.layout_rev;
+    new.simple_mode = old.simple_mode;
+    new.advanced_layout = old.advanced_layout.clone();
+    new.tour_done = old.tour_done;
 }
 
 /// RON rather than JSON: panel rects that haven't been laid out yet are
@@ -536,7 +552,8 @@ mod tests {
 
         let mut l = Layout::load_migrated(&mut ui);
         assert!(!l.is_open(Dock::Properties), "closed by the one-time update");
-        assert_eq!(ui.layout_rev, 1);
+        assert_eq!(ui.layout_rev, 2);
+        assert!(!ui.simple_mode, "an existing, customised layout keeps the full interface");
 
         // Re-opened by hand: stays open on the next load.
         l.open(Dock::Properties);
@@ -545,9 +562,47 @@ mod tests {
     }
 
     #[test]
+    fn fresh_profiles_start_simple_and_modes_swap_layouts() {
+        let mut ui = UiSettings::default();
+        let mut l = Layout::load_migrated(&mut ui);
+        assert!(ui.simple_mode && ui.layout_rev == 2);
+        // Advanced: arrange something, go Simple and back; it comes back.
+        l.set_simple(&mut ui, false);
+        l.open(Dock::Stats);
+        let advanced = serialize(&l.tree);
+        l.set_simple(&mut ui, true);
+        assert!(!l.is_open(Dock::Stats) && ui.advanced_layout.is_some());
+        l.set_simple(&mut ui, false);
+        assert!(l.is_open(Dock::Stats));
+        assert_eq!(serialize(&l.tree), advanced);
+        assert!(ui.advanced_layout.is_none());
+    }
+
+    #[test]
     fn presets_leave_properties_to_the_right_click_menu() {
         for p in PRESETS {
             assert!(!Layout::from_preset(p).is_open(Dock::Properties), "{}", p.label());
+        }
+    }
+}
+// ------------------------------------------------------------ simple/advanced
+
+impl Layout {
+    /// Switch between the Simple and Advanced interfaces. The layout of the
+    /// mode being left is parked in `ui.advanced_layout` (Advanced only), and
+    /// the other one comes back.
+    pub fn set_simple(&mut self, ui: &mut UiSettings, simple: bool) {
+        if ui.simple_mode == simple {
+            return;
+        }
+        ui.simple_mode = simple;
+        if simple {
+            ui.advanced_layout = Some(serialize(&self.tree));
+            *self = Self::from_preset(Preset::Simple);
+        } else {
+            let back = ui.advanced_layout.take().as_deref().and_then(parse);
+            self.tree = back.unwrap_or_else(|| Preset::Ferrous.build());
+            self.ensure_preview();
         }
     }
 }

@@ -36,6 +36,7 @@ pub fn start_probe(ffmpeg_setting: &str, ctx: egui::Context) -> SharedProbe {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    General,
     Stream,
     Recording,
     Video,
@@ -45,10 +46,107 @@ enum Tab {
     Advanced,
 }
 
+/// Everything worth finding in Settings, for the search box:
+/// (what the setting is called, where it lives, extra words people might type).
+const INDEX: &[(&str, Tab, &str)] = &[
+    ("Theme and colours", Tab::General, "appearance look dark light skin"),
+    ("Glass effects", Tab::General, "blur translucent transparency"),
+    ("Animated backgrounds", Tab::General, "rain stars motion animation"),
+    ("Interface size and zoom", Tab::General, "accessibility bigger smaller text scale ctrl"),
+    ("High-contrast colours", Tab::General, "accessibility contrast low vision black white"),
+    ("Colour-blind-friendly level meters", Tab::General, "accessibility colorblind red green hatch"),
+    ("Reduce motion", Tab::General, "accessibility animation calm fade"),
+    ("Check for problems before starting", Tab::General, "preflight warning helper muted problems"),
+    ("Stream service and server", Tab::Stream, "twitch youtube tiktok rtmp srt whip url"),
+    ("Stream key", Tab::Stream, "password secret"),
+    ("Streaming encoder and bitrate", Tab::Stream, "quality cbr nvenc x264 upload"),
+    ("Multistream destinations", Tab::Stream, "extra second simulcast restream"),
+    ("Recording folder", Tab::Recording, "save location path videos directory"),
+    ("File name format", Tab::Recording, "naming date time"),
+    ("Recording format", Tab::Recording, "mkv mp4 mov container"),
+    ("Audio tracks", Tab::Recording, "multitrack separate mic desktop"),
+    ("Replay buffer", Tab::Recording, "instant replay clip save last seconds"),
+    ("Recording presets and benchmark", Tab::Recording, "quality profile best settings compare test"),
+    ("Recording encoder", Tab::Recording, "nvenc quality crf hevc av1 hdr"),
+    ("HDR10 output", Tab::Recording, "hdr 10-bit bt2020 pq hevc av1"),
+    ("Canvas and output resolution", Tab::Video, "base size 1080p 1440p 4k scale"),
+    ("Frame rate", Tab::Video, "fps 30 60 120 144"),
+    ("Renderer (GPU or CPU)", Tab::Video, "compositor gpu cpu graphics"),
+    ("Vertical canvas", Tab::Video, "tiktok shorts reels 9:16 portrait"),
+    ("Color conversion", Tab::Video, "yuv nv12 ffmpeg ferrous"),
+    ("GPU readback and priority", Tab::Video, "lag latency game pipelined"),
+    ("Desktop and microphone devices", Tab::Audio, "input output speaker wasapi"),
+    ("Audio delay (sync offset)", Tab::Audio, "lip sync latency"),
+    ("Hotkeys", Tab::Hotkeys, "shortcut keyboard keys bind"),
+    ("Ferrous Link", Tab::Link, "send receive network lan second pc teleport"),
+    ("FFmpeg path", Tab::Advanced, "ffmpeg.exe encoder binary location"),
+    ("Remote control (obs-websocket)", Tab::Advanced, "stream deck touch portal streamer.bot port password"),
+    ("Plugins", Tab::Advanced, "dll extension"),
+    ("Encoders on this PC", Tab::Advanced, "scan test hardware nvenc amf qsv"),
+];
+
+impl Tab {
+    fn key(self) -> &'static str {
+        match self {
+            Tab::General => "general",
+            Tab::Stream => "stream",
+            Tab::Recording => "recording",
+            Tab::Video => "video",
+            Tab::Audio => "audio",
+            Tab::Hotkeys => "hotkeys",
+            Tab::Link => "link",
+            Tab::Advanced => "advanced",
+        }
+    }
+
+    fn from_key(k: &str) -> Self {
+        [Tab::General, Tab::Stream, Tab::Recording, Tab::Video, Tab::Audio, Tab::Hotkeys, Tab::Link, Tab::Advanced]
+            .into_iter()
+            .find(|t| t.key() == k)
+            .unwrap_or(Tab::General)
+    }
+}
+
+/// Every setting as `(name, tab key, extra search words)`, for the command palette.
+pub fn index() -> Vec<(&'static str, &'static str, &'static str)> {
+    INDEX.iter().map(|(n, t, w)| (*n, t.key(), *w)).collect()
+}
+
+fn tab_name(t: Tab) -> &'static str {
+    match t {
+        Tab::General => "General",
+        Tab::Stream => "Stream",
+        Tab::Recording => "Recording",
+        Tab::Video => "Video",
+        Tab::Audio => "Audio",
+        Tab::Hotkeys => "Hotkeys",
+        Tab::Link => "Ferrous Link",
+        Tab::Advanced => "Advanced",
+    }
+}
+
+/// Entries matching every word of `query`.
+fn search_hits(query: &str) -> Vec<(&'static str, Tab)> {
+    let words: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    INDEX
+        .iter()
+        .filter(|(name, tab, extra)| {
+            let hay = format!("{} {} {}", name, tab_name(*tab), extra).to_lowercase();
+            words.iter().all(|w| hay.contains(w.as_str()))
+        })
+        .map(|(n, t, _)| (*n, *t))
+        .collect()
+}
+
 pub struct SettingsWindow {
     pub open: bool,
     draft: Settings,
     tab: Tab,
+    /// What's typed in the search box.
+    search: String,
     show_key: bool,
     outputs: Vec<String>,
     inputs: Vec<String>,
@@ -70,7 +168,8 @@ impl SettingsWindow {
         Self {
             open: false,
             draft: Settings::default(),
-            tab: Tab::Stream,
+            tab: Tab::General,
+            search: String::new(),
             show_key: false,
             outputs: Vec::new(),
             inputs: Vec::new(),
@@ -88,6 +187,13 @@ impl SettingsWindow {
         self.open = true;
     }
 
+    /// [`open_with`](Self::open_with) on a given tab ("stream", "audio"…).
+    pub fn open_at(&mut self, current: &Settings, scenes: &ferrous_core::SceneCollection, tab: &str) {
+        self.open_with(current, scenes);
+        self.tab = Tab::from_key(tab);
+        self.search.clear();
+    }
+
     pub fn show(&mut self, ctx: &egui::Context, probe: &ProbeState) -> SettingsAction {
         let mut action = SettingsAction::None;
         if !self.open {
@@ -100,20 +206,32 @@ impl SettingsWindow {
             .collapsible(false)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    for (tab, label) in [
-                        (Tab::Stream, "Stream"),
-                        (Tab::Recording, "Recording"),
-                        (Tab::Video, "Video"),
-                        (Tab::Audio, "Audio"),
-                        (Tab::Hotkeys, "Hotkeys"),
-                        (Tab::Link, "Ferrous Link"),
-                        (Tab::Advanced, "Advanced"),
-                    ] {
-                        ui.selectable_value(&mut self.tab, tab, label);
+                    ui.add(egui::TextEdit::singleline(&mut self.search).hint_text("🔍 Search settings…").desired_width(220.0));
+                    if !self.search.is_empty() && ui.small_button("✖").clicked() {
+                        self.search.clear();
+                    }
+                });
+                let hits = search_hits(&self.search);
+                if !self.search.trim().is_empty() {
+                    if hits.is_empty() {
+                        ui.label(RichText::new("Nothing matches. Try a shorter word, like \"key\" or \"fps\".").small().color(theme::muted()));
+                    }
+                    for (name, tab) in hits.iter().take(8) {
+                        if ui.add(egui::Button::new(format!("{name}   ›   {}", tab_name(*tab))).frame(false)).clicked() {
+                            self.tab = *tab;
+                            self.search.clear();
+                        }
+                    }
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    for tab in [Tab::General, Tab::Stream, Tab::Recording, Tab::Video, Tab::Audio, Tab::Hotkeys, Tab::Link, Tab::Advanced] {
+                        ui.selectable_value(&mut self.tab, tab, tab_name(tab));
                     }
                 });
                 ui.separator();
                 egui::ScrollArea::vertical().max_height(440.0).show(ui, |ui| match self.tab {
+                    Tab::General => self.appearance(ui),
                     Tab::Stream => self.stream_tab(ui, probe),
                     Tab::Recording => self.record_tab(ui, probe),
                     Tab::Video => self.video_tab(ui),
@@ -723,11 +841,27 @@ impl SettingsWindow {
             ui.label(RichText::new("Rain, drifting glows, twinkling stars. Costs a little GPU; Off is fully static.").small().color(theme::muted()));
         });
         ui.add_space(10.0);
+        crate::widgets::section_title(ui, "Accessibility");
+        ui.horizontal(|ui| {
+            crate::widgets::row_label(ui, "Interface size");
+            for (label, v) in [("Small", 0.85), ("Normal", 1.0), ("Large", 1.25), ("Larger", 1.5), ("Huge", 2.0)] {
+                if ui.selectable_label((self.draft.ui.ui_scale - v).abs() < 0.04, label).clicked() {
+                    self.draft.ui.ui_scale = v;
+                }
+            }
+        });
+        ui.label(RichText::new("Makes text, buttons and everything else bigger or smaller. Ctrl + / Ctrl − / Ctrl 0 work anywhere.").small().color(theme::muted()));
+        ui.checkbox(&mut self.draft.ui.high_contrast, "High-contrast colours").on_hover_text("Black background, white text and strong outlines. Easier on tired or low-vision eyes.");
+        ui.checkbox(&mut self.draft.ui.meter_patterns, "Colour-blind-friendly level meters").on_hover_text("Meters get a hatched pattern in the loud zones and a palette that doesn't rely on red versus green.");
+        ui.checkbox(&mut self.draft.ui.reduce_motion, "Reduce motion").on_hover_text("Turns off animated backgrounds, fades and sliding. Nothing moves unless you move it.");
+        ui.add_space(6.0);
+        crate::widgets::section_title(ui, "Helpers");
+        ui.checkbox(&mut self.draft.ui.preflight, "Check for problems before recording or streaming").on_hover_text("Looks for a missing stream key, a muted microphone, a full drive and similar, and offers a one-click fix.");
+        ui.add_space(10.0);
     }
 
     fn advanced_tab(&mut self, ui: &mut egui::Ui, probe: &ProbeState) -> bool {
         let mut reprobe = false;
-        self.appearance(ui);
         egui::Grid::new("adv").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
             crate::widgets::row_label(ui, "FFmpeg path");
             ui.horizontal(|ui| {
@@ -876,6 +1010,28 @@ pub fn encoder_editor(ui: &mut egui::Ui, id: &str, e: &mut EncoderSettings, prob
             }
         }
 
+        if let Some(info) = catalog::find(&e.encoder) {
+            crate::widgets::row_label(ui, "Quality profile");
+            ui.horizontal(|ui| {
+                let quality_mode = matches!(e.rate_control, RateControl::Quality | RateControl::Cqp);
+                for level in ferrous_encode::presets::Level::ALL {
+                    if level == ferrous_encode::presets::Level::Small && !quality_mode {
+                        continue;
+                    }
+                    let want = ferrous_encode::presets::encoder_settings(info, level);
+                    let on = e.preset == want.preset && e.b_frames == want.b_frames && (!quality_mode || e.quality == want.quality);
+                    if ui.selectable_label(on, level.label()).on_hover_text(level.blurb()).clicked() {
+                        e.preset = want.preset;
+                        e.b_frames = want.b_frames;
+                        if quality_mode {
+                            e.quality = want.quality;
+                        }
+                    }
+                }
+            });
+            ui.end_row();
+        }
+
         crate::widgets::row_label(ui, "Rate control");
         ComboBox::from_id_salt((id, "rc")).selected_text(e.rate_control.label()).show_ui(ui, |ui| {
             for rc in RateControl::ALL {
@@ -896,7 +1052,36 @@ pub fn encoder_editor(ui: &mut egui::Ui, id: &str, e: &mut EncoderSettings, prob
             }
         }
         ui.end_row();
+        ui.label("");
+        let hint = match e.rate_control {
+            RateControl::Cbr | RateControl::Vbr => format!(
+                "≈ {:.1} GB per hour of video. Streaming it needs about {:.0} Mbps of upload speed.",
+                crate::preflight::per_hour_gb(e.bitrate_kbps, 0),
+                (e.bitrate_kbps as f32 * 1.3 / 1000.0).ceil()
+            ),
+            RateControl::Quality | RateControl::Cqp => "File size follows the picture: busy games make bigger files than a still desktop.".to_string(),
+        };
+        ui.label(RichText::new(hint).small().color(theme::muted()));
+        ui.end_row();
 
+        crate::widgets::row_label(ui, "HDR10");
+        let can = ferrous_encode::args::supports_hdr(&e.encoder);
+        ui.horizontal(|ui| {
+            ui.add_enabled(can, egui::Checkbox::new(&mut e.hdr, "Output HDR10 (10-bit, BT.2020, PQ)"))
+                .on_hover_text("Encodes 10-bit HDR10. Your SDR sources are mapped into HDR with white at the level on the right, so they look as they do now on an HDR display; true HDR capture is not in yet. Needs an HEVC or AV1 encoder and a player that understands HDR; most live services don't accept it. Recordings only, in practice.")
+                .on_disabled_hover_text("HDR10 needs an HEVC or AV1 encoder (H.264 is 8-bit).");
+            if e.hdr && can {
+                ui.add(DragValue::new(&mut e.hdr_white_nits).range(80..=400).suffix(" nits"))
+                    .on_hover_text("Brightness of SDR white inside the HDR picture. 203 is the broadcast reference; raise it if the result looks dim.");
+            }
+        });
+        ui.end_row();
+    });
+    egui::CollapsingHeader::new(RichText::new("Advanced options").small().color(theme::muted()))
+        .id_salt((id, "adv"))
+        .default_open(!e.custom_args.is_empty())
+        .show(ui, |ui| {
+            egui::Grid::new((id, "advgrid")).num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
         if let Some(info) = catalog::find(&e.encoder) {
             if !info.presets.is_empty() {
                 crate::widgets::row_label(ui, "Preset");
@@ -916,20 +1101,34 @@ pub fn encoder_editor(ui: &mut egui::Ui, id: &str, e: &mut EncoderSettings, prob
         crate::widgets::row_label(ui, "B-frames");
         ui.add(DragValue::new(&mut e.b_frames).range(0..=4));
         ui.end_row();
-        crate::widgets::row_label(ui, "HDR10");
-        let can = ferrous_encode::args::supports_hdr(&e.encoder);
-        ui.horizontal(|ui| {
-            ui.add_enabled(can, egui::Checkbox::new(&mut e.hdr, "Output HDR10 (10-bit, BT.2020, PQ)"))
-                .on_hover_text("Encodes 10-bit HDR10. Your SDR sources are mapped into HDR with white at the level on the right, so they look as they do now on an HDR display; true HDR capture is not in yet. Needs an HEVC or AV1 encoder and a player that understands HDR; most live services don't accept it. Recordings only, in practice.")
-                .on_disabled_hover_text("HDR10 needs an HEVC or AV1 encoder (H.264 is 8-bit).");
-            if e.hdr && can {
-                ui.add(DragValue::new(&mut e.hdr_white_nits).range(80..=400).suffix(" nits"))
-                    .on_hover_text("Brightness of SDR white inside the HDR picture. 203 is the broadcast reference; raise it if the result looks dim.");
-            }
-        });
-        ui.end_row();
         crate::widgets::row_label(ui, "Custom FFmpeg options");
         ui.add(egui::TextEdit::singleline(&mut e.custom_args).hint_text("-tune zerolatency").desired_width(340.0));
         ui.end_row();
-    });
+            });
+        });
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+
+    #[test]
+    fn search_finds_settings_by_name_or_by_what_people_type() {
+        let names = |q: &str| search_hits(q).into_iter().map(|(n, _)| n).collect::<Vec<_>>();
+        assert!(names("key").contains(&"Stream key"));
+        assert!(names("fps").contains(&"Frame rate"));
+        assert!(names("tiktok").contains(&"Vertical canvas"));
+        // Every word has to match.
+        assert_eq!(names("stream key"), vec!["Stream key"]);
+        assert!(names("zzzz").is_empty() && names("   ").is_empty());
+        // The tab name counts too.
+        assert!(names("recording hdr").contains(&"HDR10 output"));
+    }
+
+    #[test]
+    fn every_index_entry_points_at_a_real_tab() {
+        for (name, tab, _) in INDEX {
+            assert!(!tab_name(*tab).is_empty(), "{name}");
+        }
+    }
 }

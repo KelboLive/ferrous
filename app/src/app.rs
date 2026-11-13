@@ -15,8 +15,66 @@ use crate::widgets::{self, fmt_duration};
 
 struct Toast {
     text: String,
+    /// The raw message, when `text` is a plain-language version of it.
+    detail: Option<String>,
     error: bool,
+    action: Option<ToastAction>,
     at: Instant,
+}
+
+/// A button on a toast.
+#[derive(Clone, PartialEq)]
+enum ToastAction {
+    Undo,
+    Fix(crate::preflight::Fix),
+}
+
+/// Where a template puts a source once its size is known.
+#[derive(Clone, Copy)]
+enum Place {
+    /// Fill the canvas (letterboxed).
+    Fill,
+    /// A corner picture this fraction of the canvas wide.
+    Corner(f32),
+    /// Centred, at its own size.
+    Center,
+}
+
+/// A starting point for a new scene.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Template {
+    Blank,
+    Screen,
+    Chatting,
+    Gameplay,
+    Tutorial,
+    StartingSoon,
+}
+
+impl Template {
+    const ALL: [Template; 5] = [Template::Screen, Template::Chatting, Template::Gameplay, Template::Tutorial, Template::StartingSoon];
+
+    fn name(self) -> &'static str {
+        match self {
+            Template::Blank => "Scene",
+            Template::Screen => "Screen",
+            Template::Chatting => "Just chatting",
+            Template::Gameplay => "Gameplay",
+            Template::Tutorial => "Tutorial",
+            Template::StartingSoon => "Starting soon",
+        }
+    }
+
+    fn blurb(self) -> &'static str {
+        match self {
+            Template::Blank => "An empty scene.",
+            Template::Screen => "Your whole screen.",
+            Template::Chatting => "Your camera, full screen.",
+            Template::Gameplay => "A game with your camera in the corner.",
+            Template::Tutorial => "Your screen with your camera in the corner.",
+            Template::StartingSoon => "A colour card with a “Starting soon” message.",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -127,6 +185,17 @@ pub struct FerrousApp {
     vertical_serial: u64,
     /// Go-live prompt for destinations needing this session's server/key.
     session_prompt: Option<Vec<(String, String, String)>>,
+    palette: crate::palette::Palette,
+    /// The pre-flight window: what was about to start, and what was found.
+    preflight: Option<(crate::preflight::Kind, Vec<crate::preflight::Check>)>,
+    /// Page of the first-run tour being shown.
+    tour_step: usize,
+    troubleshooting: bool,
+    troubleshooting_filter: String,
+    /// The interface zoom last given to egui (to notice Ctrl +/− presses).
+    scale_applied: f32,
+    /// Where template sources go once their size is known.
+    pending_place: HashMap<u64, Place>,
 }
 
 impl FerrousApp {
@@ -198,6 +267,13 @@ impl FerrousApp {
             vertical_tex: None,
             vertical_serial: 0,
             session_prompt: None,
+            palette: Default::default(),
+            preflight: None,
+            tour_step: 0,
+            troubleshooting: false,
+            troubleshooting_filter: String::new(),
+            scale_applied: 1.0,
+            pending_place: HashMap::new(),
         }
     }
 
@@ -205,8 +281,18 @@ impl FerrousApp {
         let text = text.into();
         if error {
             log::error!("{text}");
+            // Say what to do about it, not what the encoder said.
+            if let Some((plain, fix)) = crate::preflight::friendly(&text) {
+                self.toasts.push(Toast { text: plain, detail: Some(text), error, action: fix.map(ToastAction::Fix), at: Instant::now() });
+                return;
+            }
         }
-        self.toasts.push(Toast { text, error, at: Instant::now() });
+        self.toasts.push(Toast { text, detail: None, error, action: None, at: Instant::now() });
+    }
+
+    /// A message with an Undo button, for things that were just removed.
+    fn toast_undo(&mut self, text: impl Into<String>) {
+        self.toasts.push(Toast { text: text.into(), detail: None, error: false, action: Some(ToastAction::Undo), at: Instant::now() });
     }
 
     fn canvas_size(&self) -> (f32, f32) {
@@ -317,6 +403,7 @@ impl FerrousApp {
                 }
             }
         }
+        self.place_pending();
         for problem in self.hotkeys.sync(&self.settings.hotkeys) {
             self.toast(problem, true);
         }
@@ -391,7 +478,7 @@ impl FerrousApp {
                 }
             }
         }
-        self.toasts.retain(|t| t.at.elapsed() < Duration::from_secs(if t.error { 10 } else { 5 }));
+        self.toasts.retain(|t| t.at.elapsed() < Duration::from_secs(if t.error || t.action.is_some() { 10 } else { 5 }));
         // New previews, hotkeys, remote commands and input all wake the UI
         // themselves, and docks that animate schedule their own repaints;
         // this slow tick only keeps clocks and status text current.
@@ -419,8 +506,12 @@ impl FerrousApp {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
-            ui.menu_button("Profile", |ui| self.library_menu(ui, ferrous_core::library::Kind::Profile));
-            ui.menu_button("Scene Collection", |ui| self.library_menu(ui, ferrous_core::library::Kind::Collection));
+            let simple = self.settings.ui.simple_mode;
+            if !simple {
+                ui.menu_button("Profile", |ui| self.library_menu(ui, ferrous_core::library::Kind::Profile));
+                ui.menu_button("Scene Collection", |ui| self.library_menu(ui, ferrous_core::library::Kind::Collection));
+            }
+            if !simple {
             ui.menu_button("View", |ui| {
                 ui.label(RichText::new("Docks").strong());
                 if crate::docks::view_menu(ui, &mut self.layout, &mut self.settings.ui, &mut self.layout_name) {
@@ -435,6 +526,7 @@ impl FerrousApp {
                     ui.close();
                 }
             });
+            }
             ui.menu_button("Tools", |ui| {
                 #[cfg(windows)]
                 {
@@ -461,7 +553,7 @@ impl FerrousApp {
                     }
                     ui.separator();
                 }
-                if ui.button("Setup & Benchmark…").clicked() {
+                if !simple && ui.button("Setup & Benchmark…").clicked() {
                     self.setup = Some(crate::setup::Setup::new(&self.settings));
                     ui.close();
                 }
@@ -520,7 +612,35 @@ impl FerrousApp {
                     ui.close();
                 }
             });
+            ui.menu_button("Help", |ui| {
+                if ui.button("Search everything…   Ctrl+K").clicked() {
+                    self.palette.toggle();
+                    ui.close();
+                }
+                if ui.button("Quick tour").clicked() {
+                    self.tour_step = 0;
+                    self.settings.ui.tour_done = false;
+                    ui.close();
+                }
+                if ui.button("Troubleshooting").clicked() {
+                    self.troubleshooting = true;
+                    ui.close();
+                }
+            });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // Simple / Advanced, always one click away.
+                let mut simple_now = self.settings.ui.simple_mode;
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(!simple_now, "Advanced").on_hover_text("Every panel and menu: studio mode, transitions, filters, stats, more.").clicked() {
+                        simple_now = false;
+                    }
+                    if ui.selectable_label(simple_now, "Simple").on_hover_text("Just scenes, sources, the preview, the mixer and the big buttons.").clicked() {
+                        simple_now = true;
+                    }
+                });
+                if simple_now != self.settings.ui.simple_mode {
+                    self.set_simple_mode(simple_now);
+                }
                 let st = self.engine.status();
                 if st.streaming.active || st.streaming.reconnecting {
                     let text = if st.streaming.reconnecting && !st.streaming.active {
@@ -545,9 +665,13 @@ impl FerrousApp {
             ui.separator();
             ui.label(small(format!("{:.1} fps", st.fps)));
             ui.separator();
-            ui.label(small(format!("render {:.1} ms", st.render_ms)));
-            ui.separator();
-            ui.label(small(format!("lagged {}", st.lagged_frames)));
+            if !self.settings.ui.simple_mode {
+                ui.label(small(format!("render {:.1} ms", st.render_ms)));
+                ui.separator();
+                ui.label(small(format!("lagged {}", st.lagged_frames)));
+            } else if st.lagged_frames > 0 {
+                ui.label(RichText::new(format!("{} late frames", st.lagged_frames)).small().color(theme::warn()));
+            }
             for (name, o) in [("stream", &st.streaming), ("rec", &st.recording)] {
                 if o.active {
                     ui.separator();
@@ -600,19 +724,48 @@ impl FerrousApp {
                     label.push_str("  ⇄");
                 }
                 let r = ui.add_sized([ui.available_width(), 26.0], egui::Button::selectable(current, label));
+                let count = self.scenes.scenes.len();
                 r.context_menu(|ui| {
                     ui.set_min_width(210.0);
-                    if ui.button("✏ Rename").clicked() {
+                    if ui.button("✏  Rename").clicked() {
                         self.rename = Some(Rename::Scene(i, self.scenes.scenes[i].name.clone()));
                         ui.close();
                     }
-                    ui.separator();
-                    let mut own = self.scenes.scenes[i].transition.is_some();
-                    if ui.checkbox(&mut own, "Own transition").on_hover_text("Use a different transition whenever this scene goes live.").changed() {
-                        self.scenes.scenes[i].transition = own.then(|| self.scenes.transition.clone());
+                    if ui.button("⧉  Duplicate").on_hover_text("Copies the scene. Screens, cameras and other live sources become clones of the originals, so nothing is captured twice.").clicked() {
+                        if let Some(at) = self.scenes.duplicate_scene(i) {
+                            self.history_note_scene_added(at);
+                        }
+                        ui.close();
                     }
-                    if let Some(t) = &mut self.scenes.scenes[i].transition {
-                        transition_editor(ui, "scene_tkind", t);
+                    ui.separator();
+                    if ui.add_enabled(i > 0, egui::Button::new("▲  Move up")).clicked() {
+                        self.scenes.move_scene(i, -1);
+                        ui.close();
+                    }
+                    if ui.add_enabled(i + 1 < count, egui::Button::new("▼  Move down")).clicked() {
+                        self.scenes.move_scene(i, 1);
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.menu_button("⇄  Transition", |ui| {
+                        ui.set_min_width(250.0);
+                        let mut own = self.scenes.scenes[i].transition.is_some();
+                        if ui.checkbox(&mut own, "Use a different transition for this scene").on_hover_text("Used whenever this scene goes live.").changed() {
+                            self.scenes.scenes[i].transition = own.then(|| self.scenes.transition.clone());
+                        }
+                        if let Some(t) = &mut self.scenes.scenes[i].transition {
+                            transition_editor(ui, "scene_tkind", t);
+                        } else {
+                            ui.label(RichText::new("Following the main transition.").small().color(theme::muted()));
+                        }
+                    });
+                    ui.separator();
+                    if ui.add_enabled(count > 1, egui::Button::new(RichText::new("🗑  Delete").color(theme::live()))).on_hover_text("Ctrl+Z brings it back.").clicked() {
+                        let name = self.scenes.scenes[i].name.clone();
+                        self.scenes.remove_scene(i);
+                        self.studio_scene = self.studio_scene.min(self.scenes.scenes.len() - 1);
+                        self.toast_undo(format!("Deleted scene “{name}”"));
+                        ui.close();
                     }
                 });
                 if r.clicked() {
@@ -631,21 +784,32 @@ impl FerrousApp {
                 self.selected = None;
             }
             ui.horizontal(|ui| {
-                if ui.button("+").on_hover_text("Add scene").clicked() {
-                    let n = self.scenes.scenes.len() + 1;
-                    let i = self.scenes.add_scene(format!("Scene {n}"));
-                    if self.studio_mode {
-                        self.studio_scene = i;
-                    } else {
-                        self.scenes.current = i;
+                let mut template = None;
+                ui.menu_button("+ New", |ui| {
+                    ui.set_min_width(260.0);
+                    if ui.button("Empty scene").clicked() {
+                        template = Some(Template::Blank);
+                        ui.close();
                     }
-                    self.rename = Some(Rename::Scene(i, format!("Scene {n}")));
+                    ui.separator();
+                    ui.label(RichText::new("Start from a template").small().color(theme::muted()));
+                    for t in Template::ALL {
+                        if ui.button(t.name()).on_hover_text(t.blurb()).clicked() {
+                            template = Some(t);
+                            ui.close();
+                        }
+                    }
+                });
+                if let Some(t) = template {
+                    self.add_scene_from_template(t);
                 }
                 let can_remove = self.scenes.scenes.len() > 1;
                 if ui.add_enabled(can_remove, egui::Button::new("−")).on_hover_text("Remove scene").clicked() {
                     let i = self.edit_index();
+                    let name = self.scenes.scenes[i].name.clone();
                     self.scenes.remove_scene(i);
                     self.studio_scene = self.studio_scene.min(self.scenes.scenes.len() - 1);
+                    self.toast_undo(format!("Deleted scene “{name}”"));
                 }
                 if ui.button("✏").on_hover_text("Rename (or double-click)").clicked() {
                     let i = self.edit_index();
@@ -655,13 +819,23 @@ impl FerrousApp {
         });
     }
 
+    /// Makes a freshly added scene the one being edited.
+    fn history_note_scene_added(&mut self, at: usize) {
+        if self.studio_mode {
+            self.studio_scene = at;
+        } else {
+            self.scenes.current = at;
+        }
+        self.selected = None;
+    }
+
     fn sources_dock(&mut self, ui: &mut egui::Ui) {
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             widgets::dock_title(ui, "Sources");
             let ids: Vec<u64> = self.edit_scene().items.iter().rev().map(|i| i.id).collect();
             if ids.is_empty() {
-                ui.label(RichText::new("No sources. Click + to add one.").small().color(theme::muted()));
+                self.empty_sources(ui);
             }
             for id in ids {
                 let errored = self.engine.source_info(id).and_then(|(_, e)| e).is_some();
@@ -776,8 +950,7 @@ impl FerrousApp {
                 let sel = self.selected;
                 if ui.add_enabled(sel.is_some(), egui::Button::new("−")).on_hover_text("Remove source").clicked() {
                     if let Some(id) = sel {
-                        self.edit_scene_mut().items.retain(|i| i.id != id);
-                        self.selected = None;
+                        self.source_action(id, SourceAction::Remove, false);
                     }
                 }
                 if ui.add_enabled(sel.is_some(), egui::Button::new("⬆")).on_hover_text("Move up").clicked() {
@@ -1454,9 +1627,18 @@ impl FerrousApp {
                 let name = self.item_mut(id).map(|i| i.name.clone()).unwrap_or_default();
                 self.rename = Some(Rename::Item(id, name));
             }
+            SourceAction::Duplicate => {
+                let scene = self.edit_index();
+                if let Some(new) = self.scenes.duplicate_item(scene, id) {
+                    self.selected = Some(new);
+                    self.toast("Duplicated as a clone of the same source (no second capture).".to_string(), false);
+                }
+            }
             SourceAction::Remove => {
+                let name = self.item_mut(id).map(|i| i.name.clone()).unwrap_or_default();
                 self.edit_scene_mut().items.retain(|i| i.id != id);
                 self.selected = None;
+                self.toast_undo(format!("Removed “{name}”"));
                 if self.props_win == Some(id) {
                     self.props_win = None;
                 }
@@ -1572,58 +1754,21 @@ impl FerrousApp {
     // ------------------------------------------------------ right: controls
 
     fn controls_dock(&mut self, ui: &mut egui::Ui) {
+        if self.settings.ui.simple_mode {
+            return self.simple_controls(ui);
+        }
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             widgets::dock_title(ui, "Controls");
             let streaming = self.engine.is_streaming();
             if widgets::action_button(ui, if streaming { "Stop Streaming" } else { "Start Streaming" }, streaming).clicked() {
-                self.perform(HotkeyAction::ToggleStreaming);
+                self.request_start(crate::preflight::Kind::Stream);
             }
             let recording = self.engine.is_recording();
             if widgets::action_button(ui, if recording { "Stop Recording" } else { "Start Recording" }, recording).clicked() {
-                self.perform(HotkeyAction::ToggleRecording);
+                self.request_start(crate::preflight::Kind::Record);
             }
-            let replay = self.engine.is_replay_active();
-            // Side by side when both labels fit, stacked full-width when the
-            // dock is narrow (a fixed minimum width ran past the dock edge).
-            let label = if replay { "Stop Replay Buffer" } else { "Start Replay Buffer" };
-            let (mut toggle, mut save) = (false, false);
-            let full = ui.available_width();
-            if full >= 300.0 {
-                ui.horizontal(|ui| {
-                    let w = (full - ui.spacing().item_spacing.x) / 2.0;
-                    toggle = ui.add_sized([w, 28.0], egui::Button::selectable(replay, label)).on_hover_text("Keeps the last few seconds in memory so you can save a replay after something happens.").clicked();
-                    save = ui.add_enabled_ui(replay, |ui| ui.add_sized([w, 28.0], egui::Button::new("💾 Save Replay")).on_hover_text("Saves the last stretch of the replay buffer to a file. Available while the buffer is running.")).inner.clicked();
-                });
-            } else {
-                toggle = ui.add_sized([full, 28.0], egui::Button::selectable(replay, label)).on_hover_text("Keeps the last few seconds in memory so you can save a replay after something happens.").clicked();
-                save = ui.add_enabled_ui(replay, |ui| ui.add_sized([full, 28.0], egui::Button::new("💾 Save Replay")).on_hover_text("Saves the last stretch of the replay buffer to a file. Available while the buffer is running.")).inner.clicked();
-            }
-            if toggle {
-                self.perform(HotkeyAction::ToggleReplayBuffer);
-            }
-            if save {
-                self.perform(HotkeyAction::SaveReplay);
-            }
-            let vcam = self.engine.virtual_camera_status();
-            let label = match vcam {
-                None => "Start Virtual Camera".to_string(),
-                Some((true, _)) => "Stop Virtual Camera  ·  in use".to_string(),
-                Some((false, _)) => "Stop Virtual Camera".to_string(),
-            };
-            let r = ui.add_sized([ui.available_width(), 28.0], egui::Button::selectable(vcam.is_some(), label)).on_hover_text(
-                "\"Ferrous Virtual Camera\" (1080p30) for Zoom, Teams, Discord, browsers… Needs Windows 11 and the camera installed once (Tools → Install Virtual Camera).",
-            );
-            if r.clicked() {
-                if vcam.is_some() {
-                    self.engine.stop_virtual_camera();
-                } else if let Err(e) = self.engine.start_virtual_camera() {
-                    self.toast(format!("{e:#}"), true);
-                }
-            }
-            if vcam.is_some() {
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
-            }
+            self.replay_and_vcam(ui);
             let label = if self.studio_mode { "Exit Studio Mode" } else { "Studio Mode" };
             if ui.add_sized([ui.available_width(), 28.0], egui::Button::selectable(self.studio_mode, label)).on_hover_text("Edit the next scene privately in a second preview, then push it live with Transition.").clicked() {
                 self.studio_mode = !self.studio_mode;
@@ -1639,6 +1784,90 @@ impl FerrousApp {
                 }
             });
         });
+    }
+
+    /// The Simple layout's controls: two big buttons and little else.
+    fn simple_controls(&mut self, ui: &mut egui::Ui) {
+        use crate::preflight::Kind as Start;
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            widgets::dock_title(ui, "Controls");
+            let big = |ui: &mut egui::Ui, text: &str, active: bool| -> egui::Response {
+                let base = if active { theme::live() } else { theme::accent().linear_multiply(0.75) };
+                ui.add_sized([ui.available_width(), 52.0], egui::Button::new(RichText::new(text).size(18.0).strong().color(Color32::WHITE)).fill(base).corner_radius(10))
+            };
+            let recording = self.engine.is_recording();
+            if big(ui, if recording { "■  Stop Recording" } else { "●  Start Recording" }, recording).on_hover_text("Saves a video of what's in the preview.").clicked() {
+                self.request_start(Start::Record);
+            }
+            let st = self.engine.status();
+            let hint = if recording { format!("Recording… {}", fmt_duration(st.recording.elapsed)) } else { format!("Saves to {}", self.settings.record.folder.display()) };
+            ui.label(RichText::new(hint).small().color(theme::muted()));
+            ui.add_space(6.0);
+            let streaming = self.engine.is_streaming();
+            if big(ui, if streaming { "■  Stop Streaming" } else { "📡  Go Live" }, streaming).on_hover_text("Streams the preview to your streaming service.").clicked() {
+                self.request_start(Start::Stream);
+            }
+            let hint = if streaming { format!("Live… {}", fmt_duration(st.streaming.elapsed)) } else { format!("To {}", self.settings.stream.service) };
+            ui.label(RichText::new(hint).small().color(theme::muted()));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("⚙ Settings").clicked() {
+                    self.settings_win.open_with(&self.settings, &self.scenes);
+                }
+                if ui.button("📁 Recordings").clicked() {
+                    open_folder(&self.settings.record.folder);
+                }
+            });
+            egui::CollapsingHeader::new(RichText::new("More").small().color(theme::muted())).id_salt("simple_more").show(ui, |ui| {
+                self.replay_and_vcam(ui);
+            });
+        });
+    }
+
+    /// Instant replay and the virtual camera.
+    fn replay_and_vcam(&mut self, ui: &mut egui::Ui) {
+        let replay = self.engine.is_replay_active();
+        // Side by side when both labels fit, stacked full-width when the
+        // dock is narrow (a fixed minimum width ran past the dock edge).
+        let label = if replay { "Stop Replay Buffer" } else { "Start Replay Buffer" };
+        let (mut toggle, mut save) = (false, false);
+        let full = ui.available_width();
+        if full >= 300.0 {
+            ui.horizontal(|ui| {
+                let w = (full - ui.spacing().item_spacing.x) / 2.0;
+                toggle = ui.add_sized([w, 28.0], egui::Button::selectable(replay, label)).on_hover_text("Keeps the last few seconds in memory so you can save a replay after something happens.").clicked();
+                save = ui.add_enabled_ui(replay, |ui| ui.add_sized([w, 28.0], egui::Button::new("💾 Save Replay")).on_hover_text("Saves the last stretch of the replay buffer to a file. Available while the buffer is running.")).inner.clicked();
+            });
+        } else {
+            toggle = ui.add_sized([full, 28.0], egui::Button::selectable(replay, label)).on_hover_text("Keeps the last few seconds in memory so you can save a replay after something happens.").clicked();
+            save = ui.add_enabled_ui(replay, |ui| ui.add_sized([full, 28.0], egui::Button::new("💾 Save Replay")).on_hover_text("Saves the last stretch of the replay buffer to a file. Available while the buffer is running.")).inner.clicked();
+        }
+        if toggle {
+            self.perform(HotkeyAction::ToggleReplayBuffer);
+        }
+        if save {
+            self.perform(HotkeyAction::SaveReplay);
+        }
+        let vcam = self.engine.virtual_camera_status();
+        let label = match vcam {
+            None => "Start Virtual Camera".to_string(),
+            Some((true, _)) => "Stop Virtual Camera  ·  in use".to_string(),
+            Some((false, _)) => "Stop Virtual Camera".to_string(),
+        };
+        let r = ui.add_sized([ui.available_width(), 28.0], egui::Button::selectable(vcam.is_some(), label)).on_hover_text(
+            "\"Ferrous Virtual Camera\" (1080p30) for Zoom, Teams, Discord, browsers… Needs Windows 11 and the camera installed once (Tools → Install Virtual Camera).",
+        );
+        if r.clicked() {
+            if vcam.is_some() {
+                self.engine.stop_virtual_camera();
+            } else if let Err(e) = self.engine.start_virtual_camera() {
+                self.toast(format!("{e:#}"), true);
+            }
+        }
+        if vcam.is_some() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        }
     }
 
     fn mixer_dock(&mut self, ui: &mut egui::Ui) {
@@ -2172,7 +2401,7 @@ impl FerrousApp {
     /// into another dock, or out of the window to float it.
     fn dock_area(&mut self, ui: &mut egui::Ui) {
         let style = crate::layout::style(ui.style().as_ref(), &self.settings.ui);
-        let locked = self.settings.ui.lock_layout;
+        let locked = self.settings.ui.lock_layout || self.settings.ui.simple_mode;
         let mates = self.layout.mates();
         let mut tree = std::mem::replace(&mut self.layout.tree, egui_stack::DockState::new(Vec::new()));
         let mut viewer = DockViewer { app: self, mates, closed: Vec::new(), locked };
@@ -2359,6 +2588,11 @@ impl FerrousApp {
         let full = ui.available_rect_before_wrap().shrink(4.0);
         if !self.studio_mode {
             self.preview(ui, full);
+            if self.edit_scene().items.is_empty() && self.settings.ui.preview_enabled {
+                let p = ui.painter_at(full);
+                p.text(full.center() - Vec2::new(0.0, 12.0), Align2::CENTER_CENTER, "This scene is empty", egui::FontId::proportional(22.0), theme::text());
+                p.text(full.center() + Vec2::new(0.0, 18.0), Align2::CENTER_CENTER, "Add your screen, a game or a camera from the Sources panel", egui::FontId::proportional(14.0), theme::muted());
+            }
             return;
         }
         // Studio mode: editable Preview | transition controls | live Program.
@@ -2813,14 +3047,16 @@ impl FerrousApp {
     }
 
     #[allow(deprecated)]
-    fn toasts_overlay(&self, ctx: &egui::Context) {
+    fn toasts_overlay(&mut self, ctx: &egui::Context) {
         if self.toasts.is_empty() {
             return;
         }
+        let mut clicked: Option<ToastAction> = None;
+        let mut dismiss: Option<usize> = None;
         egui::Area::new(egui::Id::new("toasts"))
             .anchor(Align2::RIGHT_BOTTOM, [-16.0, -40.0])
             .show(ctx, |ui| {
-                for t in &self.toasts {
+                for (n, t) in self.toasts.iter().enumerate() {
                     let color = if t.error { theme::live() } else { theme::ok() };
                     egui::Frame::new()
                         .fill(theme::surface())
@@ -2830,10 +3066,445 @@ impl FerrousApp {
                         .show(ui, |ui| {
                             ui.set_max_width(420.0);
                             ui.label(&t.text);
+                            if let Some(d) = &t.detail {
+                                ui.label(RichText::new(d).small().color(theme::muted()));
+                            }
+                            if let Some(a) = &t.action {
+                                let label = match a {
+                                    ToastAction::Undo => "↶ Undo".to_string(),
+                                    ToastAction::Fix(f) => f.label().to_string(),
+                                };
+                                ui.horizontal(|ui| {
+                                    if ui.button(label).clicked() {
+                                        clicked = Some(a.clone());
+                                        dismiss = Some(n);
+                                    }
+                                });
+                            }
                         });
                     ui.add_space(6.0);
                 }
             });
+        if let Some(n) = dismiss {
+            self.toasts.remove(n);
+        }
+        match clicked {
+            Some(ToastAction::Undo) => self.undo_edit(),
+            Some(ToastAction::Fix(f)) => self.apply_fix(f),
+            None => {}
+        }
+    }
+}
+
+/// The beginner-friendly layer: Simple mode, starting points, the
+/// pre-flight check, the command palette and the tour.
+impl FerrousApp {
+    fn set_simple_mode(&mut self, simple: bool) {
+        self.layout.set_simple(&mut self.settings.ui, simple);
+        if simple {
+            self.studio_mode = false;
+        }
+        self.toast(if simple { "Simple mode: just the essentials." } else { "Advanced mode: every panel and menu." }, false);
+    }
+
+    /// Start (or stop) recording / streaming from a button: when starting,
+    /// look for the usual problems first.
+    fn request_start(&mut self, kind: crate::preflight::Kind) {
+        use crate::preflight::Kind;
+        let (active, action) = match kind {
+            Kind::Record => (self.engine.is_recording(), HotkeyAction::ToggleRecording),
+            Kind::Stream => (self.engine.is_streaming(), HotkeyAction::ToggleStreaming),
+        };
+        if active || !self.settings.ui.preflight {
+            self.perform(action);
+            return;
+        }
+        let checks = self.run_preflight(kind);
+        if checks.is_empty() {
+            self.perform(action);
+        } else {
+            self.preflight = Some((kind, checks));
+        }
+    }
+
+    fn run_preflight(&self, kind: crate::preflight::Kind) -> Vec<crate::preflight::Check> {
+        use crate::preflight::{self, ItemInfo};
+        let items = self
+            .edit_scene()
+            .items
+            .iter()
+            .map(|i| ItemInfo {
+                id: i.id,
+                name: i.name.clone(),
+                visible: i.visible,
+                error: self.engine.source_info(i.id).and_then(|(_, e)| e),
+                display: match &i.source {
+                    SourceConfig::DisplayCapture { monitor_index, .. } => Some(*monitor_index),
+                    _ => None,
+                },
+                video: !matches!(i.source, SourceConfig::ApplicationAudio { .. }),
+            })
+            .collect();
+        let channels = self.engine.mixer().channels();
+        let muted = |id: &str| channels.iter().find(|c| c.id == id && c.active()).map(|c| c.muted());
+        let (working, found) = match &*self.probe.lock() {
+            ProbeState::Done(p) => (Some(p.working.iter().map(|e| e.name.to_string()).collect()), true),
+            ProbeState::Failed(_) => (None, false),
+            ProbeState::Running => (None, true),
+        };
+        let folder = &self.settings.record.folder;
+        preflight::run(&preflight::Inputs {
+            kind,
+            settings: &self.settings,
+            working_encoders: working,
+            ffmpeg_found: found,
+            items,
+            monitors: self.monitors.len(),
+            mic_muted: muted("mic"),
+            desktop_muted: muted("desktop"),
+            free_bytes: preflight::free_bytes(folder),
+            folder_ok: kind != preflight::Kind::Record || preflight::folder_writable(folder),
+        })
+    }
+
+    fn apply_fix(&mut self, fix: crate::preflight::Fix) {
+        use crate::preflight::Fix;
+        match fix {
+            Fix::Settings(tab) => self.settings_win.open_at(&self.settings, &self.scenes, tab),
+            Fix::Source(id) => self.source_action(id, SourceAction::Properties, false),
+            Fix::Unmute(id) => {
+                if let Some(c) = self.engine.mixer().channels().into_iter().find(|c| c.id == id) {
+                    c.set_muted(false);
+                }
+            }
+            Fix::AddSource => self.add_source.open(),
+        }
+    }
+
+    fn preflight_window(&mut self, ctx: &egui::Context) {
+        use crate::preflight::{Kind, Severity};
+        let Some((kind, checks)) = &self.preflight else { return };
+        let kind = *kind;
+        let checks = checks.clone();
+        let (mut go, mut cancel, mut fix) = (false, false, None);
+        let blocked = checks.iter().any(|c| c.severity == Severity::Error);
+        egui::Window::new(if kind == Kind::Stream { "Before you go live" } else { "Before you record" })
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .fixed_size([460.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(RichText::new(if blocked { "Something needs fixing first:" } else { "Worth a look before you start:" }).strong());
+                ui.add_space(4.0);
+                for c in &checks {
+                    let (icon, color) = if c.severity == Severity::Error { ("⛔", theme::live()) } else { ("⚠", theme::warn()) };
+                    ui.horizontal_top(|ui| {
+                        ui.label(RichText::new(icon).color(color).size(18.0));
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&c.title).strong());
+                            ui.label(RichText::new(&c.detail).small().color(theme::muted()));
+                            if let Some(f) = &c.fix {
+                                if ui.button(f.label()).clicked() {
+                                    fix = Some(f.clone());
+                                }
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let label = if kind == Kind::Stream { "Go live anyway" } else { "Record anyway" };
+                        if ui.add_enabled(!blocked, egui::Button::new(label)).on_disabled_hover_text("Fix the ⛔ items first.").clicked() {
+                            go = true;
+                        }
+                    });
+                });
+            });
+        if cancel {
+            self.preflight = None;
+        } else if go {
+            self.preflight = None;
+            self.perform(if kind == Kind::Stream { HotkeyAction::ToggleStreaming } else { HotkeyAction::ToggleRecording });
+        } else if let Some(f) = fix {
+            self.apply_fix(f);
+            // Look again, so a fixed problem disappears from the list.
+            let again = self.run_preflight(kind);
+            self.preflight = if again.is_empty() { None } else { Some((kind, again)) };
+        }
+    }
+
+    /// Adds a new source of `kind` to the scene being edited, as the Add
+    /// Source window would. Returns its id (`None` if a file picker was cancelled).
+    fn add_source_kind(&mut self, kind: crate::add_source::Kind) -> Option<u64> {
+        let (name, cfg) = self.make_source(&kind)?;
+        let r = &mut self.settings.ui.recent_sources;
+        r.retain(|k| *k != kind.key());
+        r.insert(0, kind.key());
+        r.truncate(8);
+        let target = self.edit_index();
+        let id = self.scenes.add_item_to(target, name, cfg);
+        self.pending_fit.insert(id);
+        self.selected = Some(id);
+        Some(id)
+    }
+
+    /// The Sources list of an empty scene: big tiles for the common things.
+    fn empty_sources(&mut self, ui: &mut egui::Ui) {
+        use crate::add_source::Kind;
+        ui.label(RichText::new("What do you want to show?").strong());
+        let tiles: [(&str, &str, Kind, &str); 6] = [
+            ("🖥", "My screen", Kind::Display, "Everything on your monitor."),
+            ("🪟", "A window", Kind::Window, "One program's window."),
+            ("🎮", "A game", Kind::Game, "A game that's running (best quality for games)."),
+            ("📷", "Camera", Kind::Camera, "A webcam or capture card."),
+            ("🔤", "Text", Kind::Text, "A caption or title."),
+            ("🖼", "Picture", Kind::Image, "A logo or any image file."),
+        ];
+        let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+        let mut pick = None;
+        for row in tiles.chunks(2) {
+            ui.horizontal(|ui| {
+                for (icon, label, kind, tip) in row {
+                    let text = RichText::new(format!("{icon}\n{label}")).size(14.0);
+                    if ui.add_sized([w, 54.0], egui::Button::new(text)).on_hover_text(*tip).clicked() {
+                        pick = Some(kind.clone());
+                    }
+                }
+            });
+        }
+        if ui.small_button("More kinds…").clicked() {
+            self.add_source.open();
+        }
+        if let Some(k) = pick {
+            self.add_source_kind(k);
+        }
+        ui.add_space(4.0);
+    }
+
+    /// A new scene, made current, from a template.
+    fn add_scene_from_template(&mut self, t: Template) {
+        use crate::add_source::Kind;
+        let mut name = t.name().to_string();
+        let mut n = 2;
+        while self.scenes.scenes.iter().any(|s| s.name == name) {
+            name = format!("{} {n}", t.name());
+            n += 1;
+        }
+        let idx = self.scenes.add_scene(name.clone());
+        self.history_note_scene_added(idx);
+        let add = |app: &mut Self, kind: Kind, place: Place| {
+            if let Some(id) = app.add_source_kind(kind) {
+                app.pending_fit.remove(&id);
+                app.pending_place.insert(id, place);
+            }
+        };
+        match t {
+            Template::Blank => self.rename = Some(Rename::Scene(idx, name)),
+            Template::Screen => add(self, Kind::Display, Place::Fill),
+            Template::Chatting => add(self, Kind::Camera, Place::Fill),
+            Template::Gameplay => {
+                add(self, Kind::Game, Place::Fill);
+                add(self, Kind::Camera, Place::Corner(0.22));
+            }
+            Template::Tutorial => {
+                add(self, Kind::Display, Place::Fill);
+                add(self, Kind::Camera, Place::Corner(0.2));
+            }
+            Template::StartingSoon => {
+                add(self, Kind::Color, Place::Fill);
+                if let Some(id) = self.add_source_kind(Kind::Text) {
+                    self.pending_fit.remove(&id);
+                    if let Some(it) = self.item_mut(id) {
+                        it.name = "Starting soon".into();
+                        if let SourceConfig::Text { text, size, .. } = &mut it.source {
+                            *text = "Starting soon…".into();
+                            *size = 120.0;
+                        }
+                    }
+                    self.pending_place.insert(id, Place::Center);
+                }
+            }
+        }
+        self.selected = None;
+    }
+
+    /// Moves template sources to their places once the engine knows their size.
+    fn place_pending(&mut self) {
+        let (cw, ch) = self.canvas_size();
+        let ids: Vec<u64> = self.pending_place.keys().copied().collect();
+        for id in ids {
+            if self.item_mut(id).is_none() {
+                self.pending_place.remove(&id);
+                continue;
+            }
+            let Some(((w, h), _)) = self.engine.source_info(id) else { continue };
+            if w == 0 || h == 0 {
+                continue;
+            }
+            let place = self.pending_place.remove(&id).unwrap();
+            let t = match place {
+                Place::Fill => Transform::fit_to(w, h, cw as u32, ch as u32),
+                Place::Corner(frac) => {
+                    let s = cw * frac / w as f32;
+                    let margin = cw * 0.02;
+                    Transform { x: cw - w as f32 * s - margin, y: ch - h as f32 * s - margin, scale_x: s, scale_y: s, ..Transform::default() }
+                }
+                Place::Center => Transform { x: (cw - w as f32) / 2.0, y: (ch - h as f32) / 2.0, ..Transform::default() },
+            };
+            if let Some(it) = self.item_mut(id) {
+                it.transform = t;
+            }
+        }
+    }
+
+    /// Everything the command palette can do right now.
+    fn palette_items(&self) -> Vec<crate::palette::Item> {
+        use crate::add_source::Kind;
+        use crate::palette::{Cmd, Item};
+        let rec = self.engine.is_recording();
+        let live = self.engine.is_streaming();
+        let mut v = vec![
+            Item::new(Cmd::ToggleRecording, if rec { "Stop recording" } else { "Start recording" }, "Action", "record capture save video"),
+            Item::new(Cmd::ToggleStreaming, if live { "Stop streaming" } else { "Go live (start streaming)" }, "Action", "stream broadcast twitch youtube"),
+            Item::new(Cmd::OpenSettings, "Open settings", "Action", "preferences options"),
+            Item::new(Cmd::OpenRecordings, "Open the recordings folder", "Action", "videos files saved"),
+            Item::new(Cmd::ToggleMode, if self.settings.ui.simple_mode { "Switch to Advanced mode" } else { "Switch to Simple mode" }, "Action", "layout panels easy more controls"),
+            Item::new(Cmd::Undo, "Undo", "Action", "back revert ctrl+z"),
+            Item::new(Cmd::Redo, "Redo", "Action", "forward ctrl+y"),
+            Item::new(Cmd::NewScene, "New scene", "Scene", "add create"),
+            Item::new(Cmd::ToggleReplay, "Start / stop the replay buffer", "Action", "instant replay clip"),
+            Item::new(Cmd::SaveReplay, "Save a replay clip", "Action", "instant replay"),
+            Item::new(Cmd::Tour, "Take the quick tour", "Help", "guide start learn"),
+            Item::new(Cmd::Troubleshooting, "Troubleshooting: something isn't working", "Help", "help problem fix black screen no sound lag"),
+            Item::new(Cmd::Presets, "Recording presets and benchmark", "Action", "quality compare test speed"),
+        ];
+        if !self.settings.ui.simple_mode {
+            v.push(Item::new(Cmd::StudioMode, "Studio mode on / off", "Action", "preview transition"));
+        }
+        for (i, sc) in self.scenes.scenes.iter().enumerate() {
+            v.push(Item::new(Cmd::SwitchScene(i), format!("Switch to scene: {}", sc.name), "Scene", "go show"));
+        }
+        for k in Kind::BUILTIN {
+            let words = match k {
+                Kind::Display => "screen monitor desktop",
+                Kind::Window => "program app",
+                Kind::Game => "fullscreen gameplay",
+                Kind::Camera => "webcam capture card video device",
+                Kind::Image => "picture logo png jpg",
+                Kind::Media => "video file music audio mp4",
+                Kind::Text => "caption title words",
+                Kind::Browser => "web page overlay alerts chat",
+                Kind::AppAudio => "sound program volume",
+                Kind::Color => "background solid",
+                _ => "",
+            };
+            v.push(Item::new(Cmd::AddSource(k.clone()), format!("Add source: {}", k.title()), "Source", words));
+        }
+        if let Some(id) = self.selected {
+            if let Some(it) = self.edit_scene().items.iter().find(|i| i.id == id) {
+                v.push(Item::new(Cmd::DuplicateSource, format!("Duplicate “{}”", it.name), "Source", "copy clone"));
+                v.push(Item::new(Cmd::ToggleSourceVisible, format!("{} “{}”", if it.visible { "Hide" } else { "Show" }, it.name), "Source", "eye visible"));
+                v.push(Item::new(Cmd::RemoveSource, format!("Remove “{}”", it.name), "Source", "delete"));
+            }
+        }
+        for (name, tab, words) in settings_ui::index() {
+            v.push(Item::new(Cmd::SettingsTab(tab), format!("Setting: {name}"), "Settings", words));
+        }
+        v
+    }
+
+    fn run_command(&mut self, cmd: crate::palette::Cmd) {
+        use crate::palette::Cmd;
+        use crate::preflight::Kind as Start;
+        match cmd {
+            Cmd::ToggleRecording => self.request_start(Start::Record),
+            Cmd::ToggleStreaming => self.request_start(Start::Stream),
+            Cmd::ToggleReplay => self.perform(HotkeyAction::ToggleReplayBuffer),
+            Cmd::SaveReplay => self.perform(HotkeyAction::SaveReplay),
+            Cmd::OpenSettings => self.settings_win.open_with(&self.settings, &self.scenes),
+            Cmd::SettingsTab(t) => self.settings_win.open_at(&self.settings, &self.scenes, t),
+            Cmd::AddSource(k) => {
+                self.add_source_kind(k);
+            }
+            Cmd::SwitchScene(i) => {
+                if self.studio_mode {
+                    self.studio_scene = i;
+                } else {
+                    self.scenes.current = i;
+                }
+                self.selected = None;
+            }
+            Cmd::NewScene => self.add_scene_from_template(Template::Blank),
+            Cmd::ToggleMode => self.set_simple_mode(!self.settings.ui.simple_mode),
+            Cmd::Undo => self.undo_edit(),
+            Cmd::Redo => self.redo_edit(),
+            Cmd::OpenRecordings => open_folder(&self.settings.record.folder),
+            Cmd::Tour => {
+                self.tour_step = 0;
+                self.settings.ui.tour_done = false;
+            }
+            Cmd::Troubleshooting => self.troubleshooting = true,
+            Cmd::DuplicateSource | Cmd::ToggleSourceVisible | Cmd::RemoveSource => {
+                let Some(id) = self.selected else { return };
+                match cmd {
+                    Cmd::DuplicateSource => self.source_action(id, SourceAction::Duplicate, false),
+                    Cmd::RemoveSource => self.source_action(id, SourceAction::Remove, false),
+                    _ => {
+                        if let Some(it) = self.item_mut(id) {
+                            it.visible = !it.visible;
+                        }
+                    }
+                }
+            }
+            Cmd::StudioMode => {
+                self.studio_mode = !self.studio_mode;
+                self.studio_scene = self.scenes.current;
+                self.selected = None;
+            }
+            Cmd::Presets => self.settings_win.open_at(&self.settings, &self.scenes, "recording"),
+        }
+    }
+
+    /// Per-frame hooks: zoom, Ctrl+K, the palette, pre-flight window, the
+    /// tour and troubleshooting.
+    fn helpers(&mut self, ctx: &egui::Context) {
+        // Interface zoom: the setting and Ctrl +/− agree with each other.
+        let z = ctx.zoom_factor();
+        if (z - self.scale_applied).abs() > 0.001 {
+            self.settings.ui.ui_scale = z.clamp(0.8, 2.0);
+            self.scale_applied = z;
+        } else if (self.settings.ui.ui_scale - self.scale_applied).abs() > 0.001 {
+            let want = self.settings.ui.ui_scale.clamp(0.8, 2.0);
+            ctx.set_zoom_factor(want);
+            self.scale_applied = want;
+        }
+        theme::sync_access(ctx, self.settings.ui.high_contrast, self.settings.ui.meter_patterns, self.settings.ui.reduce_motion);
+
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K)) {
+            self.palette.toggle();
+        }
+        if self.palette.open {
+            let items = self.palette_items();
+            if let Some(cmd) = self.palette.show(ctx, &items) {
+                self.run_command(cmd);
+            }
+        }
+        self.preflight_window(ctx);
+        crate::help::troubleshooting(ctx, &mut self.troubleshooting, &mut self.troubleshooting_filter);
+
+        let first_run_over = self.settings.ui.setup_done || self.setup_dismissed;
+        if !self.settings.ui.tour_done && first_run_over && self.setup.is_none() && self.wizard.is_none() {
+            let progress = crate::help::Progress { has_source: self.scenes.scenes.iter().any(|s| !s.items.is_empty()), recording: self.engine.is_recording() };
+            if let crate::help::TourEvent::Done = crate::help::tour(ctx, &mut self.tour_step, progress) {
+                self.settings.ui.tour_done = true;
+                let _ = self.library.save_profile(&self.active.profile, &self.settings);
+            }
+        }
     }
 }
 
@@ -2968,6 +3639,7 @@ impl eframe::App for FerrousApp {
                 }
             }
         }
+        self.helpers(&ctx);
         self.projector_window(&ctx);
         self.multiview_window(&ctx);
         self.history_tick(&ctx);
@@ -3182,6 +3854,7 @@ enum SourceAction {
     Properties,
     Filters,
     Rename,
+    Duplicate,
     Remove,
     MoveUp,
     MoveDown,
@@ -3199,41 +3872,50 @@ enum SourceAction {
     ResetCrop,
 }
 
-/// A source's right-click menu (Sources list and canvas), laid out like OBS's.
+/// A source's right-click menu (Sources list and canvas): the everyday
+/// actions first, layout tools in submenus, and the destructive one last.
 fn source_menu(ui: &mut egui::Ui, visible: bool, locked: bool, keep_running: bool) -> Option<SourceAction> {
     let mut pick = None;
+    ui.set_min_width(210.0);
     let mut item = |ui: &mut egui::Ui, label: &str, a: SourceAction| {
         if ui.button(label).clicked() {
             pick = Some(a);
             ui.close();
         }
     };
-    item(ui, "Properties", SourceAction::Properties);
-    item(ui, "Filters", SourceAction::Filters);
+    item(ui, "⚙  Properties", SourceAction::Properties);
+    item(ui, "🎚  Filters", SourceAction::Filters);
     ui.separator();
-    item(ui, "Rename  (F2)", SourceAction::Rename);
-    item(ui, "Remove", SourceAction::Remove);
+    item(ui, if visible { "🙈  Hide" } else { "👁  Show" }, SourceAction::ToggleVisible);
+    item(ui, if locked { "🔓  Unlock" } else { "🔒  Lock" }, SourceAction::ToggleLock);
+    item(ui, "⧉  Duplicate", SourceAction::Duplicate);
+    item(ui, "✏  Rename   F2", SourceAction::Rename);
     ui.separator();
-    ui.menu_button("Order", |ui| {
-        item(ui, "Move Up", SourceAction::MoveUp);
-        item(ui, "Move Down", SourceAction::MoveDown);
-        item(ui, "Move to Top", SourceAction::MoveTop);
-        item(ui, "Move to Bottom", SourceAction::MoveBottom);
-    });
-    ui.menu_button("Transform", |ui| {
-        item(ui, "Reset Transform", SourceAction::ResetTransform);
+    ui.menu_button("↔  Transform", |ui| {
         item(ui, "Fit to Screen", SourceAction::FitToScreen);
         item(ui, "Stretch to Screen", SourceAction::StretchToScreen);
-        item(ui, "Center to Screen", SourceAction::CenterOnScreen);
+        item(ui, "Center on Screen", SourceAction::CenterOnScreen);
         ui.separator();
         item(ui, "Rotate 90° Clockwise", SourceAction::RotateCw);
         item(ui, "Rotate 90° Counter-clockwise", SourceAction::RotateCcw);
+        ui.separator();
         item(ui, "Remove Crop", SourceAction::ResetCrop);
+        item(ui, "Reset Transform", SourceAction::ResetTransform);
+    });
+    ui.menu_button("☰  Order", |ui| {
+        item(ui, "Bring to Front", SourceAction::MoveTop);
+        item(ui, "Move Up", SourceAction::MoveUp);
+        item(ui, "Move Down", SourceAction::MoveDown);
+        item(ui, "Send to Back", SourceAction::MoveBottom);
+    });
+    ui.menu_button("More", |ui| {
+        item(ui, if keep_running { "Allow to sleep when hidden" } else { "Keep running when hidden" }, SourceAction::ToggleKeepRunning);
     });
     ui.separator();
-    item(ui, if visible { "Hide" } else { "Show" }, SourceAction::ToggleVisible);
-    item(ui, if locked { "Unlock" } else { "Lock" }, SourceAction::ToggleLock);
-    item(ui, if keep_running { "Allow to sleep when hidden" } else { "Keep running when hidden" }, SourceAction::ToggleKeepRunning);
+    if ui.button(RichText::new("🗑  Remove").color(theme::live())).clicked() {
+        pick = Some(SourceAction::Remove);
+        ui.close();
+    }
     pick
 }
 
