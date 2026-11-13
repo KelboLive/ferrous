@@ -1,0 +1,14 @@
+[package]
+name = "ferrous-obs"
+description = "OBS plugin bridge: runs OBS plugin sources in a helper process that hosts the real libobs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrous-core.workspace = true
+anyhow.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true

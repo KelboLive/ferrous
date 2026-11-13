@@ -1,0 +1,8 @@
+[package]
+name = "ferrous-plugin-api"
+description = "Stable C ABI for Ferrous plugins (sources, video filters, audio filters)"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+
+[dependencies]

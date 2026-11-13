@@ -1,0 +1,13 @@
+[package]
+name = "ferrous-encode"
+description = "Encoder catalog, hardware probing and FFmpeg argument generation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrous-core.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

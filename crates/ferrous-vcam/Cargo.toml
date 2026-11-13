@@ -1,0 +1,15 @@
+[package]
+name = "ferrous-vcam"
+description = "Ferrous virtual camera: shared-memory frame transport and Windows camera control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_Security", "Win32_Security_Authorization", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry"] }
+
+[target.'cfg(unix)'.dependencies]
+memmap2 = "0.9"

@@ -1,0 +1,31 @@
+[package]
+name = "ferrous-engine"
+description = "Ties sources, compositor, audio and outputs together on a fixed frame clock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rayon.workspace = true
+ferrous-sysmon.workspace = true
+ferrous-link.workspace = true
+ferrous-plugins.workspace = true
+ferrous-core.workspace = true
+ferrous-encode.workspace = true
+ferrous-render.workspace = true
+ferrous-capture.workspace = true
+ferrous-audio.workspace = true
+ferrous-output.workspace = true
+ferrous-vcam.workspace = true
+
+anyhow.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+
+[dev-dependencies]
+ferrous-obs.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Render-thread priority (SetThreadPriority).
+windows = { version = "0.62", features = ["Win32_System_Threading"] }

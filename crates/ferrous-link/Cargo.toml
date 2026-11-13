@@ -1,0 +1,25 @@
+[package]
+name = "ferrous-link"
+description = "Ferrous Link: low-latency video/audio between Ferrous instances on a LAN (successor to obs-teleport)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrous-core.workspace = true
+ferrous-encode.workspace = true
+ferrous-output.workspace = true
+anyhow.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+lz4_flex.workspace = true
+chacha20poly1305.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
+if-addrs = "0.15.0"
+socket2 = "0.6.5"
+turbojpeg = { version = "1.5", default-features = false, features = ["cmake", "require-simd"] }

@@ -1,0 +1,19 @@
+[package]
+name = "ferrous-output"
+description = "Recording and streaming outputs driven by FFmpeg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrous-core.workspace = true
+ferrous-encode.workspace = true
+anyhow.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+chrono.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+ferrous-render.workspace = true

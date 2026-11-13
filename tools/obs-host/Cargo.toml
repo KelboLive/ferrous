@@ -1,0 +1,16 @@
+[package]
+name = "ferrous-obs-host"
+description = "Ferrous's OBS plugin host: runs OBS plugin sources on the real libobs, outside Ferrous's process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ferrous-obs-host"
+path = "src/main.rs"
+
+[dependencies]
+ferrous-obs.workspace = true
+libloading.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true

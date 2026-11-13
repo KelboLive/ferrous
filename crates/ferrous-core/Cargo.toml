@@ -1,0 +1,13 @@
+[package]
+name = "ferrous-core"
+description = "Scene model, settings and shared types for Ferrous"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+dirs.workspace = true
+log.workspace = true

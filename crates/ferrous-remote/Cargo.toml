@@ -1,0 +1,16 @@
+[package]
+name = "ferrous-remote"
+description = "obs-websocket v5 compatible remote-control server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+serde_json.workspace = true
+tungstenite.workspace = true
+sha2.workspace = true
+base64.workspace = true

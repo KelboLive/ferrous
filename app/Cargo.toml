@@ -1,0 +1,46 @@
+[package]
+name = "ferrous"
+description = "Ferrous: a Windows recording and streaming studio written in Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ferrous"
+path = "src/main.rs"
+
+[dependencies]
+ferrous-bench.workspace = true
+ferrous-sysmon.workspace = true
+ferrous-link.workspace = true
+ferrous-plugins.workspace = true
+ferrous-core.workspace = true
+ferrous-encode.workspace = true
+ferrous-capture.workspace = true
+ferrous-audio.workspace = true
+ferrous-engine.workspace = true
+ferrous-render.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+eframe.workspace = true
+rfd.workspace = true
+parking_lot.workspace = true
+ferrous-vst3.workspace = true
+ferrous-vcam.workspace = true
+ferrous-obs.workspace = true
+dirs.workspace = true
+global-hotkey.workspace = true
+ferrous-remote.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+egui_stack.workspace = true
+ron.workspace = true
+crossbeam-channel.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Custom browser docks: a WebView2 child window laid over the dock's rect.
+wry = { version = "0.57", default-features = false }
+
+[build-dependencies]
+embed-resource = "3.0.12"

@@ -1,0 +1,13 @@
+[package]
+name = "ferrous-example-plugin"
+description = "Example Ferrous plugin: a gradient source, an invert filter and a gain filter"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ferrous-plugin-api.workspace = true
+serde_json.workspace = true

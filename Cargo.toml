@@ -1,0 +1,98 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ferrous-core",
+    "crates/ferrous-encode",
+    "crates/ferrous-render",
+    "crates/ferrous-capture",
+    "crates/ferrous-audio",
+    "crates/ferrous-output",
+    "crates/ferrous-engine",
+    "crates/ferrous-remote",
+    "crates/ferrous-link",
+    "crates/ferrous-matte",
+    "crates/ferrous-sysmon",
+    "crates/ferrous-bench",
+    "crates/ferrous-vst3",
+    "crates/ferrous-vcam",
+    "crates/ferrous-vcam-source",
+    "crates/ferrous-obs",
+    "tools/obs-host",
+    "plugins/vst3-test-gain",
+    "crates/ferrous-plugin-api",
+    "crates/ferrous-plugins",
+    "plugins/example",
+    "app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+rust-version = "1.85"
+
+[workspace.dependencies]
+ferrous-core = { path = "crates/ferrous-core" }
+ferrous-encode = { path = "crates/ferrous-encode" }
+ferrous-render = { path = "crates/ferrous-render" }
+ferrous-capture = { path = "crates/ferrous-capture" }
+ferrous-audio = { path = "crates/ferrous-audio" }
+ferrous-output = { path = "crates/ferrous-output" }
+ferrous-engine = { path = "crates/ferrous-engine" }
+ferrous-remote = { path = "crates/ferrous-remote" }
+ferrous-plugin-api = { path = "crates/ferrous-plugin-api" }
+ferrous-link = { path = "crates/ferrous-link" }
+ferrous-matte = { path = "crates/ferrous-matte" }
+ferrous-sysmon = { path = "crates/ferrous-sysmon" }
+ferrous-bench = { path = "crates/ferrous-bench" }
+ferrous-plugins = { path = "crates/ferrous-plugins" }
+ferrous-vst3 = { path = "crates/ferrous-vst3" }
+ferrous-vcam = { path = "crates/ferrous-vcam" }
+ferrous-obs = { path = "crates/ferrous-obs" }
+
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+rayon = "1"
+chrono = "0.4"
+dirs = "6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp"] }
+cpal = "0.18"
+eframe = { version = "0.37", default-features = false, features = ["persistence", "wgpu", "default_fonts", "system_fonts", "clipboard", "links", "accesskit"] }
+egui_stack = { version = "0.25", features = ["serde"] }
+ron = "0.12"
+rfd = "0.15"
+windows-capture = "2.0"
+wgpu = "30"
+wasapi = "0.27"
+fontdue = "0.9"
+global-hotkey = "0.10"
+tungstenite = "0.30"
+sha2 = "0.10"
+base64 = "0.22"
+libloading = "0.8"
+lz4_flex = "0.11"
+chacha20poly1305 = "0.10"
+getrandom = "0.3"
+sysinfo = "0.37"
+ureq = { version = "3", features = ["json"] }
+nnnoiseless = { version = "0.5", default-features = false }
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Pixel loops are painfully slow unoptimised; keep debug builds usable.
+[profile.dev.package."*"]
+opt-level = 2
+[profile.dev]
+opt-level = 1

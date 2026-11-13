@@ -1,0 +1,19 @@
+[package]
+name = "ferrous-render"
+description = "Scene compositor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ferrous-plugins.workspace = true
+ferrous-core.workspace = true
+ferrous-matte.workspace = true
+rayon.workspace = true
+parking_lot.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+anyhow.workspace = true
+image.workspace = true

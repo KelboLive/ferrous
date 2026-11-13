@@ -1,0 +1,51 @@
+name: Windows build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch FFmpeg (GPL build: x264, x265, SVT-AV1, AOM, NVENC, QSV, AMF)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+          Invoke-WebRequest $url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg-dl
+          $bin = (Get-ChildItem ffmpeg-dl -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
+          echo "$bin" >> $env:GITHUB_PATH
+          echo "FFMPEG_BIN=$bin" >> $env:GITHUB_ENV
+
+      - name: Test
+        run: cargo test --workspace --release
+
+      - name: Build
+        run: cargo build --release -p ferrous -p ferrous-vcam-source -p ferrous-obs-host
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/ferrous.exe dist/
+          Copy-Item target/release/ferrous_vcam_source.dll dist/ferrous_vcam.dll
+          Copy-Item target/release/ferrous-obs-host.exe dist/
+          Copy-Item "$env:FFMPEG_BIN/ffmpeg.exe" dist/
+          Copy-Item "$env:FFMPEG_BIN/ffprobe.exe" dist/
+          Copy-Item README.md dist/
+          New-Item -ItemType Directory dist/plugins | Out-Null
+          cargo build --release -p ferrous-example-plugin
+          Copy-Item target/release/ferrous_example_plugin.dll dist/plugins/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferrous-windows-x64
+          path: dist/
