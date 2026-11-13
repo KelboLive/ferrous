@@ -229,3 +229,78 @@ fn receiver_follows_encoder_switches() {
         drop(s);
     }
 }
+
+/// A sender that misbehaves (empty message, short audio, a zero-size lossless frame) must not
+/// take the receiver down: it keeps running and reconnects.
+#[test]
+fn receiver_survives_a_hostile_sender() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let hello = br#"{"proto":3,"name":"evil","width":320,"height":180,"fps":30,"codec":"Lossless","audio":true,"encrypted":false,"salt":""}"#;
+    let evil = std::thread::spawn(move || {
+        let mut sessions = 0;
+        listener.set_nonblocking(false).unwrap();
+        let end = Instant::now() + Duration::from_secs(12);
+        while sessions < 2 && Instant::now() < end {
+            listener.set_nonblocking(true).unwrap();
+            let Ok((mut s, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            };
+            s.set_nonblocking(false).unwrap();
+            let send = |s: &mut std::net::TcpStream, body: &[u8]| {
+                s.write_all(&(body.len() as u32).to_be_bytes()).unwrap();
+                s.write_all(body).unwrap();
+            };
+            send(&mut s, hello);
+            let mut len = [0u8; 4];
+            s.read_exact(&mut len).unwrap();
+            let mut auth = vec![0u8; u32::from_be_bytes(len) as usize];
+            s.read_exact(&mut auth).unwrap();
+            send(&mut s, &[]); // zero-length message
+            send(&mut s, &[4, 1, 2]); // audio, shorter than its timestamp
+            let mut video = vec![2u8]; // VIDEO: header with a 0x0 picture, then junk
+            video.extend_from_slice(&[0; 16]);
+            video.extend_from_slice(&[1, 0xFF, 0xFF, 0xFF, 0xFF]);
+            send(&mut s, &video);
+            std::thread::sleep(Duration::from_millis(300));
+            drop(s); // hang up: a healthy receiver reconnects
+            sessions += 1;
+        }
+        sessions
+    });
+    let rx = LinkReceiver::start(&addr, "", PathBuf::from("ffmpeg"), None);
+    assert_eq!(evil.join().unwrap(), 2, "the receiver stopped reconnecting after hostile input");
+    drop(rx);
+}
+
+fn read_hello_salt(port: u16) -> String {
+    use std::io::Read;
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut len = [0u8; 4];
+    c.read_exact(&mut len).unwrap();
+    let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+    c.read_exact(&mut body).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    v["salt"].as_str().unwrap().to_string()
+}
+
+/// Every connection must be encrypted under its own key. With one salt per sender, the nonce counters
+/// (which restart at 0 on each connection) repeated under the same key.
+#[test]
+fn each_connection_gets_a_fresh_salt() {
+    let s = LinkSender::start(cfg("Salty", LinkCodec::Jpeg { quality: 80, adaptive: false }, "2468")).unwrap();
+    let (a, b) = (read_hello_salt(s.port), read_hello_salt(s.port));
+    assert!(!a.is_empty() && !b.is_empty());
+    assert_ne!(a, b, "two connections shared a key");
+}
+
+/// A peer that connects and never speaks must not stop others joining.
+#[test]
+fn a_silent_connection_does_not_block_real_receivers() {
+    let s = LinkSender::start(cfg("Busy", LinkCodec::Jpeg { quality: 80, adaptive: false }, "")).unwrap();
+    let _silent: Vec<_> = (0..3).map(|_| std::net::TcpStream::connect(("127.0.0.1", s.port)).unwrap()).collect();
+    let r = LinkReceiver::start(&format!("127.0.0.1:{}", s.port), "", PathBuf::from("ffmpeg"), None);
+    assert!(pump(&s, &r, &frame(9), 4).is_some(), "a real receiver waited behind silent peers");
+}

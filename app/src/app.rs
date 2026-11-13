@@ -788,7 +788,7 @@ impl FerrousApp {
                 }
                 self.selected = None;
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let mut template = None;
                 ui.menu_button("+ New", |ui| {
                     ui.set_min_width(260.0);
@@ -948,7 +948,7 @@ impl FerrousApp {
                     self.source_action(id, SourceAction::Rename, false);
                 }
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("+").on_hover_text("Add a source").clicked() {
                     self.add_source.open();
                 }

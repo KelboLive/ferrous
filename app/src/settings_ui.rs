@@ -224,7 +224,7 @@ impl SettingsWindow {
                     }
                 }
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     for tab in [Tab::General, Tab::Stream, Tab::Recording, Tab::Video, Tab::Audio, Tab::Hotkeys, Tab::Link, Tab::Advanced] {
                         ui.selectable_value(&mut self.tab, tab, tab_name(tab));
                     }

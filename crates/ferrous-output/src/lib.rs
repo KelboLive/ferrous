@@ -268,6 +268,12 @@ pub fn build_args(cfg: &OutputConfig, audio_ports: &[u16]) -> Vec<String> {
     a
 }
 
+/// How long Stop waits for FFmpeg to finish writing before killing it.
+#[cfg(not(test))]
+const STOP_GRACE: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const STOP_GRACE: Duration = Duration::from_millis(1500);
+
 /// A running output. Dropping it stops it cleanly.
 pub struct Output {
     video_tx: Option<Sender<VideoFrame>>,
@@ -483,10 +489,26 @@ impl Output {
     fn shutdown(&mut self) -> anyhow::Result<()> {
         self.video_tx.take();
         self.audio_stop.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + STOP_GRACE;
+        // The writer threads can be stuck in a pipe write if FFmpeg has stopped reading (a stalled
+        // network stream, say). Waiting for them with no limit would freeze whoever pressed Stop,
+        // so past the deadline FFmpeg is killed, which fails the writes and lets the threads end.
+        let mut killed = false;
+        while self.threads.iter().any(|t| !t.is_finished()) {
+            if !killed && Instant::now() > deadline {
+                let _ = self.child.lock().kill();
+                killed = true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
-        let deadline = Instant::now() + Duration::from_secs(15);
+        if killed {
+            let _ = self.child.lock().wait();
+            self.stats.running.store(false, Ordering::Relaxed);
+            anyhow::bail!("FFmpeg didn't finish in time and was killed");
+        }
         loop {
             let mut child = self.child.lock();
             match child.try_wait()? {
@@ -624,6 +646,32 @@ mod tests {
         let j = build_args(&cfg("av1_vulkan", ConversionMode::Ffmpeg), &[5000]).join(" ");
         assert!(j.contains("-init_hw_device vulkan=ember"), "{j}");
         assert!(j.contains("format=nv12,hwupload"), "{j}");
+    }
+
+    /// An FFmpeg that stops reading its input (a stalled stream) must not make Stop hang.
+    #[cfg(unix)]
+    #[test]
+    fn stop_does_not_hang_when_ffmpeg_stops_reading() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ferrous-stall-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("fake-ffmpeg");
+        std::fs::write(&fake, "#!/bin/sh\nexec sleep 120\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut c = cfg("libx264", ConversionMode::Ffmpeg);
+        c.ffmpeg = fake;
+        let out = Output::start(c, vec![]).unwrap();
+        let frame = VideoFrame::solid(1280, 720, [1, 2, 3, 255]);
+        for _ in 0..40 {
+            out.push_frame(&frame); // fills the pipe: the writer thread blocks in write_all
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(out.stop().is_err());
+        });
+        let killed = done_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("Stop hung on a stalled FFmpeg");
+        assert!(killed, "a stalled FFmpeg should be reported as killed");
     }
 
     /// End to end through real FFmpeg: an Ferrous-converted recording decodes

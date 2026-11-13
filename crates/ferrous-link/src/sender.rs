@@ -4,7 +4,7 @@ use std::io::{BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -240,8 +240,9 @@ impl LinkSender {
         let clients: Clients = Arc::default();
         let stop = Arc::new(AtomicBool::new(false));
         let force_key = Arc::new(AtomicBool::new(false));
-        let salt = protocol::random_hex(16);
-        let key = (!cfg.pin.is_empty()).then(|| protocol::derive_key(&cfg.pin, &salt));
+        // The key is derived per connection (fresh salt in each Hello). One key shared by every
+        // connection would reuse AEAD nonces, since the counters restart at 0 on each one.
+        let pin = cfg.pin.clone();
         let hello = Hello {
             proto: protocol::PROTO_VERSION,
             name: cfg.name.clone(),
@@ -250,47 +251,64 @@ impl LinkSender {
             fps: cfg.fps,
             codec: codec_kind(&cfg.codec),
             audio: cfg.audio,
-            encrypted: key.is_some(),
-            salt,
+            encrypted: !pin.is_empty(),
+            salt: String::new(),
         };
         let mut threads = Vec::new();
 
         // Accept + handshake.
         {
             let (clients, stop, force_key, stats) = (clients.clone(), stop.clone(), force_key.clone(), stats.clone());
-            let hello = serde_json::to_vec(&hello)?;
+            let hello = Arc::new(hello);
+            let pending = Arc::new(AtomicUsize::new(0));
+            let last_warned: Arc<Mutex<std::collections::HashMap<std::net::IpAddr, Instant>>> = Arc::default();
             threads.push(thread::Builder::new().name("link-accept".into()).spawn(move || {
-                let mut last_warned: std::collections::HashMap<std::net::IpAddr, Instant> = std::collections::HashMap::new();
                 while !stop.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, addr)) => {
                             let _ = stream.set_nonblocking(false);
                             let _ = stream.set_nodelay(true);
-                            match handshake(stream, &hello, key) {
-                                Ok((stream, rx_cipher, tx_cipher)) => {
-                                    log::info!("Ferrous Link: receiver {addr} connected");
-                                    add_client(&clients, stream, rx_cipher, tx_cipher, stats.clone());
-                                    force_key.store(true, Ordering::Relaxed);
-                                }
-                                Err(e) => {
-                                    // A receiver that keeps retrying would log this every
-                                    // couple of seconds: once a minute per address is enough.
-                                    let now = Instant::now();
-                                    let quiet = last_warned.get(&addr.ip()).is_some_and(|t: &Instant| now - *t < Duration::from_secs(60));
-                                    if !quiet {
-                                        last_warned.insert(addr.ip(), now);
-                                        let eof = e.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof);
-                                        if eof {
-                                            log::warn!(
-                                                "Ferrous Link: receiver {} hung up during the handshake. It is probably running a different \
-                                                 Ferrous version; install the same build on both PCs. (Repeats are not logged for a minute.)",
-                                                addr.ip()
-                                            );
-                                        } else {
-                                            log::warn!("Ferrous Link: receiver {addr} rejected: {e} (repeats are not logged for a minute)");
+                            // Handshakes run off the accept thread: a peer that connects and goes quiet holds
+                            // only its own (time-limited) handshake, not everyone else's. A cap keeps a flood
+                            // of such peers from piling up threads.
+                            if pending.fetch_add(1, Ordering::Relaxed) >= MAX_PENDING_HANDSHAKES {
+                                pending.fetch_sub(1, Ordering::Relaxed);
+                                continue;
+                            }
+                            let (hello, pin, clients, force_key, stats, in_thread, last_warned) =
+                                (hello.clone(), pin.clone(), clients.clone(), force_key.clone(), stats.clone(), pending.clone(), last_warned.clone());
+                            let spawned = thread::Builder::new().name("link-handshake".into()).spawn(move || {
+                                let result = handshake(stream, &hello, &pin);
+                                in_thread.fetch_sub(1, Ordering::Relaxed);
+                                match result {
+                                    Ok((stream, rx_cipher, tx_cipher)) => {
+                                        log::info!("Ferrous Link: receiver {addr} connected");
+                                        add_client(&clients, stream, rx_cipher, tx_cipher, stats);
+                                        force_key.store(true, Ordering::Relaxed);
+                                    }
+                                    Err(e) => {
+                                        // A receiver that keeps retrying would log this every
+                                        // couple of seconds: once a minute per address is enough.
+                                        let now = Instant::now();
+                                        let mut seen = last_warned.lock();
+                                        seen.retain(|_, t| now - *t < Duration::from_secs(60));
+                                        if seen.insert(addr.ip(), now).is_none() {
+                                            let eof = e.downcast_ref::<std::io::Error>().is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof);
+                                            if eof {
+                                                log::warn!(
+                                                    "Ferrous Link: receiver {} hung up during the handshake. It is probably running a different \
+                                                     Ferrous version; install the same build on both PCs. (Repeats are not logged for a minute.)",
+                                                    addr.ip()
+                                                );
+                                            } else {
+                                                log::warn!("Ferrous Link: receiver {addr} rejected: {e} (repeats are not logged for a minute)");
+                                            }
                                         }
                                     }
                                 }
+                            });
+                            if spawned.is_err() {
+                                pending.fetch_sub(1, Ordering::Relaxed);
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(30)),
@@ -632,9 +650,18 @@ impl Drop for LinkSender {
     }
 }
 
-fn handshake(mut stream: TcpStream, hello: &[u8], key: Option<[u8; 32]>) -> anyhow::Result<(TcpStream, Cipher, Cipher)> {
+/// Handshakes allowed at once; further connections are dropped until one finishes.
+const MAX_PENDING_HANDSHAKES: usize = 8;
+
+/// Sends the Hello (with a fresh salt, so every connection has its own key) and checks the receiver's
+/// first message. Fails after 5 s of silence.
+fn handshake(mut stream: TcpStream, hello: &Hello, pin: &str) -> anyhow::Result<(TcpStream, Cipher, Cipher)> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    protocol::write_raw(&mut stream, hello)?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut hello = hello.clone();
+    hello.salt = protocol::random_hex(16);
+    let key = (!pin.is_empty()).then(|| protocol::derive_key(pin, &hello.salt));
+    protocol::write_raw(&mut stream, &serde_json::to_vec(&hello)?)?;
     // Direction 1 = sender→receiver, 2 = receiver→sender.
     let tx = Cipher::new(key, 1);
     let mut rx = Cipher::new(key, 2);
@@ -643,6 +670,7 @@ fn handshake(mut stream: TcpStream, hello: &[u8], key: Option<[u8; 32]>) -> anyh
         anyhow::bail!("bad handshake");
     }
     stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
     Ok((stream, rx, tx))
 }
 

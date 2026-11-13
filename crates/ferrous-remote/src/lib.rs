@@ -67,6 +67,11 @@ pub fn auth_response(password: &str, salt: &str, challenge: &str) -> String {
     b64.encode(Sha256::digest(format!("{secret}{challenge}").as_bytes()))
 }
 
+/// Equal-length comparison that does not stop at the first difference.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 fn random_token() -> String {
     // Not security-critical randomness beyond replay protection; mix time and address entropy.
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
@@ -200,6 +205,8 @@ fn serve(
     stop: &AtomicBool,
 ) -> anyhow::Result<()> {
     stream.set_nonblocking(false)?;
+    // A peer that connects and says nothing must not hold a thread forever.
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     // obs-websocket clients negotiate the `obswebsocket.json` subprotocol.
     // (The callback's error type is fixed by tungstenite.)
     #[allow(clippy::result_large_err)]
@@ -221,15 +228,19 @@ fn serve(
     }
     send(&mut ws, json!({ "op": 0, "d": hello }))?;
 
+    let started = std::time::Instant::now();
     let mut identified = false;
     let mut subscriptions = intent::ALL;
     while !stop.load(Ordering::Relaxed) {
-        if identified {
-            while let Ok((intent, msg)) = events.try_recv() {
-                if subscriptions & intent != 0 {
-                    ws.send(Message::text(msg))?;
-                }
+        // Events queue per connection from the moment it connects; an unidentified client must not let them pile up.
+        while let Ok((intent, msg)) = events.try_recv() {
+            if identified && subscriptions & intent != 0 {
+                ws.send(Message::text(msg))?;
             }
+        }
+        if !identified && started.elapsed() > Duration::from_secs(10) {
+            close(&mut ws, 4007, "not identified in time");
+            return Ok(());
         }
         let msg = match ws.read() {
             Ok(m) => m,
@@ -249,6 +260,11 @@ fn serve(
         let op = v["op"].as_u64().unwrap_or(u64::MAX);
         let d = &v["d"];
         match op {
+            // Reidentify only updates an identified session. Accepting it first would skip the password.
+            3 if !identified => {
+                close(&mut ws, 4007, "not identified");
+                return Ok(());
+            }
             1 | 3 => {
                 // Identify / Reidentify
                 if op == 1 {
@@ -258,7 +274,7 @@ fn serve(
                     }
                     if let Some(pw) = password {
                         let expected = auth_response(pw, &salt, &challenge);
-                        if d["authentication"].as_str() != Some(expected.as_str()) {
+                        if !constant_time_eq(d["authentication"].as_str().unwrap_or("").as_bytes(), expected.as_bytes()) {
                             close(&mut ws, 4009, "authentication failed");
                             return Ok(());
                         }
@@ -416,6 +432,32 @@ mod tests {
                 }
                 Ok(_) => continue,
                 Err(e) => panic!("expected close frame, got {e}"),
+            }
+        }
+    }
+
+    /// Reidentify (op 3) must not be a way around the password: before the
+    /// first successful Identify the server has to refuse it.
+    #[test]
+    fn reidentify_cannot_skip_authentication() {
+        let (calls, _h) = responder();
+        let server = RemoteServer::start(0, Some("right".into()), calls, Arc::new(|| {})).unwrap();
+        let mut ws = connect(server.port());
+        let _hello = read_json(&mut ws);
+        ws.send(Message::text(json!({ "op": 3, "d": {} }).to_string())).unwrap();
+        ws.send(Message::text(
+            json!({ "op": 6, "d": { "requestType": "GetCurrentProgramScene", "requestId": "x" } }).to_string(),
+        ))
+        .unwrap();
+        loop {
+            match ws.read() {
+                Ok(Message::Close(_)) | Err(_) => break, // refused: good
+                Ok(Message::Text(t)) => {
+                    let v: Value = serde_json::from_str(&t).unwrap();
+                    assert_ne!(v["op"], 7, "an unauthenticated client got a request response: {v}");
+                    assert_ne!(v["op"], 2, "Reidentify identified an unauthenticated client");
+                }
+                Ok(_) => continue,
             }
         }
     }

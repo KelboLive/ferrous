@@ -4,6 +4,8 @@ Newest first. Each entry lists what changed for users; the detail and test evide
 [`docs/PROGRESS.md`](docs/PROGRESS.md).
 
 ## v0.4 (unreleased)
+- **Security and robustness pass**: the remote-control server no longer lets a client skip the password with Reidentify; Ferrous Link survives malformed or hostile senders (empty/short messages, absurd picture sizes), encrypts each connection under its own key, and no longer lets a silent peer block new receivers; Stop no longer hangs when FFmpeg stops reading (it is killed after 15 s).
+- **Debug pass**: damaged settings, scene and library files are repaired or kept as `.bad` instead of failing; 14 corrupt-profile launches (truncated, empty, binary, zero/huge fps, bad UI scale or layout) start cleanly; Settings tabs and the scene/source button rows now wrap in narrow windows so nothing is unreachable.
 - **Recording presets and a speed/quality benchmark** (Settings → Recording).
 - **HDR10 output** for HEVC and AV1 (SDR sources mapped to BT.2020/PQ, adjustable white level).
 - **Encoder quality pass**: NVENC two-pass and lookahead, H.264 High profile, AV1 10-bit internals, Quick Sync

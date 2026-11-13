@@ -12,6 +12,17 @@ pub(crate) fn header(ts: u64, w: u32, h: u32) -> Vec<u8> {
     v
 }
 
+/// Largest picture a link will carry (about 8K at 4 bytes a pixel, with room to spare).
+pub const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
+
+/// Byte size of a BGRA frame, or `None` for a zero side or one too big to
+/// trust: sizes come off the network, so `w * h * 4` must not wrap or
+/// ask for gigabytes.
+pub fn frame_bytes(w: u32, h: u32) -> Option<usize> {
+    let n = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    (n > 0 && n <= MAX_FRAME_BYTES).then_some(n)
+}
+
 pub fn parse_header(p: &[u8]) -> Option<(u64, u32, u32, &[u8])> {
     if p.len() < 16 {
         return None;
@@ -112,11 +123,12 @@ impl JpegDecoder {
     }
 
     pub fn decode(&mut self, jpeg: &[u8], w: u32, h: u32) -> Option<VideoFrame> {
+        let size = frame_bytes(w, h)?;
         let head = self.d.read_header(jpeg).ok()?;
         if (head.width, head.height) != (w as usize, h as usize) {
             return None;
         }
-        let (mut buf, _) = self.pool.take((w * h * 4) as usize);
+        let (mut buf, _) = self.pool.take(size);
         let image = turbojpeg::Image {
             pixels: buf.as_mut_slice(),
             width: w as usize,
@@ -215,24 +227,30 @@ pub struct LosslessDecoder {
 
 impl LosslessDecoder {
     pub fn decode(&mut self, data: &[u8], w: u32, h: u32) -> Option<VideoFrame> {
+        let total = frame_bytes(w, h)?;
+        let n = chunk_len(total);
+        let expected = total.div_ceil(n);
         let key = *data.first()? == 1;
         let count = u32::from_be_bytes(data.get(1..5)?.try_into().ok()?) as usize;
-        let mut off = 5;
+        // The count is the peer's word: check it before reserving anything.
+        if count != expected {
+            return None;
+        }
+        let mut off = 5usize;
         let mut blocks = Vec::with_capacity(count);
         for _ in 0..count {
-            let len = u32::from_be_bytes(data.get(off..off + 4)?.try_into().ok()?) as usize;
+            let len = u32::from_be_bytes(data.get(off..off.checked_add(4)?)?.try_into().ok()?) as usize;
             off += 4;
-            blocks.push(data.get(off..off + len)?);
-            off += len;
-        }
-        let total = (w * h * 4) as usize;
-        let n = chunk_len(total);
-        if blocks.len() != total.div_ceil(n) {
-            return None;
+            blocks.push(data.get(off..off.checked_add(len)?)?);
+            off = off.checked_add(len)?;
         }
         let prev = if key { None } else { Some(self.prev.as_ref().filter(|p| (p.width, p.height) == (w, h))?.clone()) };
         let mut out = vec![0u8; total];
         let ok = out.par_chunks_mut(n).zip(blocks.into_par_iter()).enumerate().all(|(i, (dst, block))| {
+            // The size prefix is untrusted too: it must match the chunk before LZ4 allocates it.
+            if block.get(..4).map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize) != Some(dst.len()) {
+                return false;
+            }
             let Ok(raw) = lz4_flex::decompress_size_prepended(block) else { return false };
             if raw.len() != dst.len() {
                 return false;
@@ -306,6 +324,38 @@ mod tests {
         let key = e.encode(&a, 1, true).0.len();
         let same = e.encode(&a, 1, false).0.len();
         assert!(same * 20 < key, "static delta {same} vs keyframe {key}");
+    }
+
+    #[test]
+    fn hostile_headers_are_refused_not_fatal() {
+        // Zero, wrapping and absurd sizes; a chunk count of four billion; a lying LZ4 size prefix.
+        let mut d = LosslessDecoder::default();
+        let mut huge_count = vec![1u8];
+        huge_count.extend_from_slice(&u32::MAX.to_be_bytes());
+        for (w, h) in [(0, 0), (0, 10), (65535, 65535), (u32::MAX, u32::MAX), (100_000, 100_000)] {
+            assert!(d.decode(&huge_count, w, h).is_none(), "{w}x{h}");
+            assert!(JpegDecoder::new().unwrap().decode(&[0xFF, 0xD8], w, h).is_none(), "{w}x{h}");
+        }
+        assert!(d.decode(&huge_count, 64, 64).is_none(), "count must match the picture");
+        let n = chunk_len(64 * 64 * 4);
+        let mut lying = vec![1u8];
+        lying.extend_from_slice(&((64usize * 64 * 4).div_ceil(n) as u32).to_be_bytes());
+        for _ in 0..(64usize * 64 * 4).div_ceil(n) {
+            let mut blk = u32::MAX.to_le_bytes().to_vec(); // "decompresses to 4 GB"
+            blk.extend_from_slice(&[0; 8]);
+            lying.extend_from_slice(&(blk.len() as u32).to_be_bytes());
+            lying.extend_from_slice(&blk);
+        }
+        assert!(d.decode(&lying, 64, 64).is_none());
+    }
+
+    #[test]
+    fn frame_bytes_checks_sizes() {
+        assert_eq!(frame_bytes(1920, 1080), Some(1920 * 1080 * 4));
+        assert_eq!(frame_bytes(7680, 4320), Some(7680 * 4320 * 4));
+        assert_eq!(frame_bytes(0, 5), None);
+        assert_eq!(frame_bytes(65535, 65535), None);
+        assert_eq!(frame_bytes(u32::MAX, u32::MAX), None);
     }
 
     #[test]

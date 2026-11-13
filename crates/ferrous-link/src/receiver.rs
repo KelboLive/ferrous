@@ -205,6 +205,19 @@ impl Drop for LinkReceiver {
     }
 }
 
+/// The PCM part of an audio message (after its 8-byte timestamp); empty if the message is too short.
+fn audio_pcm(p: &[u8]) -> &[u8] {
+    p.get(8..).unwrap_or(&[])
+}
+
+/// Stops the pinger thread however `session` is left, including early `?` returns.
+struct StopOnDrop(Arc<AtomicBool>);
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Feeds an FFmpeg decoder for byte-stream (hardware codec) links. FFmpeg
 /// decodes on the GPU where it can and hands back NV12 (1.5 bytes per pixel
 /// through the pipe instead of 4), which Ferrous converts on all cores.
@@ -216,6 +229,7 @@ struct StreamDecoder {
 impl StreamDecoder {
     fn start(ffmpeg: &std::path::Path, w: u32, h: u32, timeline: Arc<Mutex<Timeline>>, stats: Arc<ReceiverStats>) -> anyhow::Result<Self> {
         let (w, h) = ((w & !1).max(2), (h & !1).max(2));
+        anyhow::ensure!(codec::frame_bytes(w, h).is_some(), "unusable picture size {w}x{h}");
         let mut child = ferrous_encode::ffmpeg::command(ffmpeg)
             .args(["-hide_banner", "-loglevel", "error", "-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32", "-analyzeduration", "0"])
             // The stream starts on PAT + PMT + keyframe, so the parameters are in the first few
@@ -232,13 +246,13 @@ impl StreamDecoder {
         let stdin = child.stdin.take().unwrap();
         let mut stdout = child.stdout.take().unwrap();
         thread::Builder::new().name("link-stream-dec".into()).spawn(move || {
-            let mut nv12 = vec![0u8; (w * h + 2 * (w / 2) * (h / 2)) as usize];
+            let mut nv12 = vec![0u8; w as usize * h as usize * 3 / 2];
             let mut pool = ferrous_core::FramePool::default();
             loop {
                 if stdout.read_exact(&mut nv12).is_err() {
                     break;
                 }
-                let (mut bgra, _) = pool.take((w * h * 4) as usize);
+                let (mut bgra, _) = pool.take(w as usize * h as usize * 4);
                 codec::nv12_to_bgra(&nv12, w as usize, h as usize, &mut bgra);
                 let f = VideoFrame::new(w, h, bgra);
                 pool.track(&f);
@@ -364,6 +378,9 @@ fn session(
             protocol::PROTO_VERSION
         );
     }
+    if codec::frame_bytes(hello.width, hello.height).is_none() || hello.fps == 0 || hello.fps > 1000 {
+        anyhow::bail!("\"{}\" announced a picture size this PC can't use ({}x{} at {} fps)", hello.name, hello.width, hello.height, hello.fps);
+    }
     if hello.encrypted && pin.is_empty() {
         anyhow::bail!("\"{}\" needs a PIN", hello.name);
     }
@@ -381,6 +398,7 @@ fn session(
     // Pinger: one round trip per second for RTT and clock offset (µs).
     let offset = Arc::new(Mutex::new(0i64));
     let alive = Arc::new(AtomicBool::new(true));
+    let _alive_guard = StopOnDrop(alive.clone());
     {
         let (tx, alive) = (tx.clone(), alive.clone());
         let mut w = stream.try_clone()?;
@@ -486,7 +504,8 @@ fn session(
             first = false;
             stats.connected.store(true, Ordering::Relaxed);
         }
-        let (k, p) = (body[0], &body[1..]);
+        // A zero-length message is legal framing: it must not index past the end.
+        let Some((&k, p)) = body.split_first() else { continue };
         match k {
             kind::VIDEO => {
                 let job = (seq, arrived, p.to_vec());
@@ -537,7 +556,7 @@ fn session(
             }
             kind::AUDIO => {
                 if let Some(sink) = &audio {
-                    let samples: Vec<f32> = p[8..].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect();
+                    let samples: Vec<f32> = audio_pcm(p).chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect();
                     sink(&samples);
                 }
             }
@@ -569,6 +588,25 @@ fn session(
     let _ = presenter.join();
     timeline.lock().queue.clear();
     result
+}
+
+#[cfg(test)]
+mod hostile_input_tests {
+    use super::*;
+
+    #[test]
+    fn short_audio_messages_are_empty_not_fatal() {
+        assert!(audio_pcm(&[]).is_empty());
+        assert!(audio_pcm(&[0; 7]).is_empty());
+        assert_eq!(audio_pcm(&[0; 12]).len(), 4);
+    }
+
+    #[test]
+    fn stopping_the_session_stops_the_pinger() {
+        let alive = Arc::new(AtomicBool::new(true));
+        drop(StopOnDrop(alive.clone()));
+        assert!(!alive.load(Ordering::Relaxed));
+    }
 }
 
 #[cfg(test)]
