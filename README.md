@@ -140,8 +140,11 @@ The previous to-do list is done (see "README to-do list" in `docs/PROGRESS.md`).
 - **Run the Windows-only parts on real hardware.** The virtual camera source, VST3 editor windows,
   the D3D12/Vulkan encoders and the OBS host on `obs.dll` all compile for Windows, but haven't run
   on a Windows machine yet.
-- **True zero-copy encoding** (the canvas texture straight to the hardware encoder without a trip
-  through system memory). It needs the encoder in-process rather than through FFmpeg's pipe.
+- **Optional: zero-copy encoding** (the canvas texture straight to the hardware encoder without a trip
+  through system memory). It would need an in-process encoder (Media Foundation) instead of FFmpeg's pipe.
+  It only matters for 4K60 and very high frame rates; at 1080p/1440p the FFmpeg route is just as fast and
+  keeps every tuned encoder option (NVENC multipass, lookahead, AV1, 10-bit HDR10), so it is not planned
+  unless those resolutions become a target.
 - **OBS plugin filters** through the bridge (sources work today).
 
 ## License
