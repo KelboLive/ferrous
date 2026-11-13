@@ -3270,8 +3270,18 @@ impl FerrousApp {
         for row in tiles.chunks(2) {
             ui.horizontal(|ui| {
                 for (icon, label, kind, tip) in row {
-                    let text = RichText::new(format!("{icon}\n{label}")).size(14.0);
-                    if ui.add_sized([w, 54.0], egui::Button::new(text)).on_hover_text(*tip).clicked() {
+                    // Painted by hand so the icon and the label are each centred.
+                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 56.0), Sense::click());
+                    let resp = resp.on_hover_text(*tip);
+                    let fill = if resp.is_pointer_button_down_on() { theme::surface().gamma_multiply(0.8) } else if resp.hovered() { theme::surface().lerp_to_gamma(Color32::WHITE, 0.1) } else { theme::surface() };
+                    let p = ui.painter();
+                    p.rect_filled(rect, 8.0, fill);
+                    if resp.hovered() {
+                        p.rect_stroke(rect, 8.0, Stroke::new(1.0, theme::accent()), StrokeKind::Inside);
+                    }
+                    p.text(rect.center() - Vec2::new(0.0, 10.0), Align2::CENTER_CENTER, icon, egui::FontId::proportional(20.0), theme::text());
+                    p.text(rect.center() + Vec2::new(0.0, 16.0), Align2::CENTER_CENTER, label, egui::FontId::proportional(13.0), theme::text());
+                    if resp.clicked() {
                         pick = Some(kind.clone());
                     }
                 }
