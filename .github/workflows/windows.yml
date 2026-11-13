@@ -15,7 +15,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Fetch FFmpeg (GPL build: x264, x265, SVT-AV1, AOM, NVENC, QSV, AMF)
+      - name: "Fetch FFmpeg (GPL build with x264, x265, SVT-AV1, AOM, NVENC, QSV, AMF)"
         shell: pwsh
         run: |
           $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
