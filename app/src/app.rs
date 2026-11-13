@@ -279,6 +279,7 @@ impl FerrousApp {
 
     fn toast(&mut self, text: impl Into<String>, error: bool) {
         let text = text.into();
+        self.toasts.retain(|t| t.text != text || t.action.is_some());
         if error {
             log::error!("{text}");
             // Say what to do about it, not what the encoder said.
@@ -288,10 +289,14 @@ impl FerrousApp {
             }
         }
         self.toasts.push(Toast { text, detail: None, error, action: None, at: Instant::now() });
+        let extra = self.toasts.len().saturating_sub(5);
+        self.toasts.drain(..extra);
     }
 
     /// A message with an Undo button, for things that were just removed.
     fn toast_undo(&mut self, text: impl Into<String>) {
+        // One Undo at a time is enough; older ones would undo the wrong thing.
+        self.toasts.retain(|t| t.action != Some(ToastAction::Undo));
         self.toasts.push(Toast { text: text.into(), detail: None, error: false, action: Some(ToastAction::Undo), at: Instant::now() });
     }
 
@@ -3326,7 +3331,17 @@ impl FerrousApp {
                 add(self, Kind::Camera, Place::Corner(0.2));
             }
             Template::StartingSoon => {
-                add(self, Kind::Color, Place::Fill);
+                // A colour card the size of the canvas, so it fills the picture.
+                let (cw, ch) = self.canvas_size();
+                if let Some(id) = self.add_source_kind(Kind::Color) {
+                    self.pending_fit.remove(&id);
+                    if let Some(it) = self.item_mut(id) {
+                        if let SourceConfig::Color { width, height, .. } = &mut it.source {
+                            (*width, *height) = (cw as u32, ch as u32);
+                        }
+                        it.transform = Transform::default();
+                    }
+                }
                 if let Some(id) = self.add_source_kind(Kind::Text) {
                     self.pending_fit.remove(&id);
                     if let Some(it) = self.item_mut(id) {

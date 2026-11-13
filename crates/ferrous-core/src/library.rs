@@ -122,7 +122,20 @@ impl Library {
     }
 
     pub fn load_collection(&self, name: &str) -> SceneCollection {
-        SceneCollection::load(&self.collection_path(name)).unwrap_or_default()
+        let path = self.collection_path(name);
+        match SceneCollection::load(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                // A missing file is normal (first run); a damaged one is kept
+                // aside so the next save doesn't destroy someone's scenes.
+                if path.exists() {
+                    let bad = path.with_extension("json.bad");
+                    log::warn!("scene collection {} is unreadable ({e}); kept as {}", path.display(), bad.display());
+                    let _ = std::fs::copy(&path, &bad);
+                }
+                SceneCollection::default()
+            }
+        }
     }
 
     pub fn save_collection(&self, name: &str, c: &SceneCollection) -> anyhow::Result<()> {
@@ -175,6 +188,22 @@ pub enum Kind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_damaged_scene_collection_is_kept_aside_and_a_missing_one_is_not() {
+        let root = std::env::temp_dir().join(format!("ferrous-lib-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let lib = Library::open(&root);
+        let c = lib.load_collection("Nope");
+        assert_eq!(c.scenes.len(), 1);
+        assert!(!lib.collection_path("Nope").with_extension("json.bad").exists());
+        std::fs::write(lib.collection_path("Broken"), "{ not json").unwrap();
+        let c = lib.load_collection("Broken");
+        assert_eq!(c.scenes.len(), 1);
+        assert!(lib.collection_path("Broken").with_extension("json.bad").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn migrate_list_rename_remove() {

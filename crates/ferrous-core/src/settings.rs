@@ -667,12 +667,42 @@ impl Settings {
     /// Loads settings, falling back to defaults (and logging) on any error so
     /// a corrupt file never prevents the app from starting.
     pub fn load_or_default(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
+        let mut s = match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
-                log::warn!("settings file is invalid ({e}); using defaults");
+                // Keep the damaged file instead of silently overwriting it
+                // with defaults the next time settings are saved.
+                let bad = path.with_extension("json.bad");
+                let kept = std::fs::copy(path, &bad).is_ok();
+                log::warn!("settings file is invalid ({e}); using defaults{}", if kept { format!(", the old file is kept as {}", bad.display()) } else { String::new() });
                 Self::default()
             }),
             Err(_) => Self::default(),
+        };
+        s.sanitize();
+        s
+    }
+
+    /// Puts hand-edited or damaged values back into a range the rest of the
+    /// program can work with (a frame rate of 0 or a NaN zoom would otherwise
+    /// crash something far from where the bad value came from).
+    pub fn sanitize(&mut self) {
+        let v = &mut self.video;
+        v.fps = v.fps.clamp(1, 240);
+        let even = |x: u32| (x.clamp(16, 16384)) & !1;
+        v.base_width = even(v.base_width);
+        v.base_height = even(v.base_height);
+        v.output_width = even(v.output_width);
+        v.output_height = even(v.output_height);
+        v.vertical = v.vertical.map(|(w, h)| (even(w), even(h)));
+        let u = &mut self.ui;
+        u.ui_scale = if u.ui_scale.is_finite() { u.ui_scale.clamp(0.8, 2.0) } else { 1.0 };
+        u.glass = u.glass.min(2);
+        u.motion = u.motion.min(2);
+        for e in [&mut self.stream.encoder, &mut self.record.encoder] {
+            e.bitrate_kbps = e.bitrate_kbps.clamp(100, 500_000);
+            e.keyframe_interval_secs = e.keyframe_interval_secs.clamp(1, 20);
+            e.b_frames = e.b_frames.min(8);
+            e.hdr_white_nits = e.hdr_white_nits.clamp(50, 1000);
         }
     }
 
@@ -787,5 +817,53 @@ mod tests {
         assert_eq!(s.video.fps, 30);
         assert_eq!(s.video.base_width, 1920);
         assert_eq!(s.stream.encoder.encoder, "libx264");
+    }
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+
+    #[test]
+    fn damaged_values_are_pulled_back_into_range() {
+        let mut s = Settings::default();
+        s.video.fps = 0;
+        s.video.base_width = 0;
+        s.video.output_height = 1_000_001;
+        s.video.vertical = Some((1, 99_999));
+        s.ui.ui_scale = f32::NAN;
+        s.ui.glass = 9;
+        s.stream.encoder.bitrate_kbps = 0;
+        s.stream.encoder.keyframe_interval_secs = 0;
+        s.sanitize();
+        assert_eq!(s.video.fps, 1);
+        assert!(s.video.base_width >= 16 && s.video.base_width % 2 == 0);
+        assert_eq!(s.video.output_height, 16384);
+        assert_eq!(s.video.vertical, Some((16, 16384)));
+        assert_eq!(s.ui.ui_scale, 1.0);
+        assert_eq!(s.ui.glass, 2);
+        assert_eq!(s.stream.encoder.bitrate_kbps, 100);
+        assert_eq!(s.stream.encoder.keyframe_interval_secs, 1);
+    }
+
+    #[test]
+    fn defaults_are_already_sane() {
+        let mut s = Settings::default();
+        let before = serde_json::to_string(&s).unwrap();
+        s.sanitize();
+        assert_eq!(before, serde_json::to_string(&s).unwrap());
+    }
+
+    #[test]
+    fn a_broken_file_is_kept_aside_not_lost() {
+        let dir = std::env::temp_dir().join("ferrous-bad-settings-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("p.json");
+        std::fs::write(&f, "{ \"video\": { \"fps\": \"sixty\" } }").unwrap();
+        let s = Settings::load_or_default(&f);
+        assert_eq!(s.video.fps, Settings::default().video.fps);
+        assert!(dir.join("p.json.bad").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

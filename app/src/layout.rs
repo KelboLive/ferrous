@@ -443,6 +443,28 @@ pub fn style(egui_style: &egui::Style, cfg: &UiSettings) -> Style {
     s
 }
 
+// ------------------------------------------------------------ simple/advanced
+
+impl Layout {
+    /// Switch between the Simple and Advanced interfaces. The layout of the
+    /// mode being left is parked in `ui.advanced_layout` (Advanced only), and
+    /// the other one comes back.
+    pub fn set_simple(&mut self, ui: &mut UiSettings, simple: bool) {
+        if ui.simple_mode == simple {
+            return;
+        }
+        ui.simple_mode = simple;
+        if simple {
+            ui.advanced_layout = Some(serialize(&self.tree));
+            *self = Self::from_preset(Preset::Simple);
+        } else {
+            let back = ui.advanced_layout.take().as_deref().and_then(parse);
+            self.tree = back.unwrap_or_else(|| Preset::Ferrous.build());
+            self.ensure_preview();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,30 +601,21 @@ mod tests {
     }
 
     #[test]
+    fn garbage_layouts_fall_back_instead_of_crashing() {
+        assert!(parse("").is_none() && parse("(((").is_none() && parse("{\"a\":1}").is_none());
+        let mut ui = UiSettings { layout: Some("not a layout".into()), advanced_layout: Some("???".into()), simple_mode: true, layout_rev: 2, ..Default::default() };
+        let l = Layout::load_migrated(&mut ui);
+        assert!(l.is_open(Dock::Preview) && l.is_open(Dock::Scenes));
+        // Leaving Simple mode with a damaged parked layout gives the default one.
+        let mut l = l;
+        l.set_simple(&mut ui, false);
+        assert!(l.is_open(Dock::Preview) && l.is_open(Dock::Controls));
+    }
+
+    #[test]
     fn presets_leave_properties_to_the_right_click_menu() {
         for p in PRESETS {
             assert!(!Layout::from_preset(p).is_open(Dock::Properties), "{}", p.label());
-        }
-    }
-}
-// ------------------------------------------------------------ simple/advanced
-
-impl Layout {
-    /// Switch between the Simple and Advanced interfaces. The layout of the
-    /// mode being left is parked in `ui.advanced_layout` (Advanced only), and
-    /// the other one comes back.
-    pub fn set_simple(&mut self, ui: &mut UiSettings, simple: bool) {
-        if ui.simple_mode == simple {
-            return;
-        }
-        ui.simple_mode = simple;
-        if simple {
-            ui.advanced_layout = Some(serialize(&self.tree));
-            *self = Self::from_preset(Preset::Simple);
-        } else {
-            let back = ui.advanced_layout.take().as_deref().and_then(parse);
-            self.tree = back.unwrap_or_else(|| Preset::Ferrous.build());
-            self.ensure_preview();
         }
     }
 }

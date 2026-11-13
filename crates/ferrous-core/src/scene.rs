@@ -599,7 +599,9 @@ impl Default for Transition {
 pub struct SceneCollection {
     pub scenes: Vec<Scene>,
     /// The program (live) scene.
+    #[serde(default)]
     pub current: usize,
+    #[serde(default)]
     next_id: u64,
     /// Used whenever the program scene changes.
     #[serde(default)]
@@ -790,6 +792,8 @@ impl SceneCollection {
         if c.scenes.is_empty() {
             c.scenes.push(Scene::new("Scene"));
         }
+        // A hand-edited file can point at a scene that isn't there.
+        c.current = c.current.min(c.scenes.len() - 1);
         // Repair id counter in case the file was edited by hand.
         let max = c.scenes.iter().flat_map(|s| &s.items).map(|i| i.id).max().unwrap_or(0);
         c.next_id = c.next_id.max(max + 1);
@@ -809,6 +813,25 @@ impl SceneCollection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loading_repairs_an_out_of_range_current_scene_and_an_empty_file() {
+        let dir = std::env::temp_dir().join("ferrous-scene-load-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut c = SceneCollection::default();
+        c.add_scene("Two");
+        c.current = 1;
+        c.save(&dir.join("c.json")).unwrap();
+        let text = std::fs::read_to_string(dir.join("c.json")).unwrap().replace("\"current\": 1", "\"current\": 40");
+        std::fs::write(dir.join("c.json"), text).unwrap();
+        let l = SceneCollection::load(&dir.join("c.json")).unwrap();
+        assert_eq!(l.current, l.scenes.len() - 1);
+        std::fs::write(dir.join("e.json"), "{\"scenes\": [], \"current\": 3}").unwrap();
+        let e = SceneCollection::load(&dir.join("e.json")).unwrap();
+        assert_eq!((e.scenes.len(), e.current), (1, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn roundtrip_and_ids() {
