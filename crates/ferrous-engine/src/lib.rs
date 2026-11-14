@@ -307,12 +307,13 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 impl Engine {
     pub fn start(settings: Settings, scenes: SceneCollection) -> Self {
-        let (tx, rx) = crossbeam_channel::unbounded();
+        // Bounded: events are tiny and drained every UI frame; if nobody reads them, the newest are dropped.
+        let (tx, rx) = crossbeam_channel::bounded(1024);
         // Load plugin DLLs once per process.
         static PLUGINS: std::sync::Once = std::sync::Once::new();
         PLUGINS.call_once(|| {
             for problem in ferrous_plugins::load_dirs(&ferrous_plugins::default_dirs()) {
-                let _ = tx.send(EngineEvent::Error(format!("Plugin not loaded: {problem}")));
+                let _ = tx.try_send(EngineEvent::Error(format!("Plugin not loaded: {problem}")));
             }
         });
         let shared = Arc::new(Shared {
@@ -543,10 +544,10 @@ impl Engine {
             thread::spawn(move || match out.stop() {
                 Ok(()) => {
                     let p = path.map(|p| p.display().to_string()).unwrap_or_default();
-                    let _ = events.send(EngineEvent::Info(format!("Recording saved: {p}")));
+                    let _ = events.try_send(EngineEvent::Info(format!("Recording saved: {p}")));
                 }
                 Err(e) => {
-                    let _ = events.send(EngineEvent::Error(format!("Recording failed: {e}")));
+                    let _ = events.try_send(EngineEvent::Error(format!("Recording failed: {e}")));
                 }
             });
         }
@@ -608,7 +609,7 @@ impl Engine {
             self.shared.outputs.lock().extras = extras;
         }
         for e in &errors {
-            let _ = self.shared.events.send(EngineEvent::Error(format!("Destination not started: {e}")));
+            let _ = self.shared.events.try_send(EngineEvent::Error(format!("Destination not started: {e}")));
         }
         if s.stream.server.trim().is_empty() {
             return if self.is_streaming() { Ok(()) } else { Err(anyhow::anyhow!(errors.join("; "))) };
@@ -656,7 +657,7 @@ impl Engine {
             #[cfg(windows)]
             camera,
         });
-        let _ = self.shared.events.send(EngineEvent::Info("Virtual camera started".into()));
+        let _ = self.shared.events.try_send(EngineEvent::Info("Virtual camera started".into()));
         Ok(())
     }
 
@@ -744,20 +745,20 @@ impl Engine {
             let (ffmpeg, vdir, events) = (ffmpeg.clone(), vdir.clone(), events.clone());
             thread::spawn(move || match ferrous_output::save_replay(&ffmpeg, &vdir, secs, REPLAY_SEGMENT_SECS, &vpath, fmt) {
                 Ok(()) => {
-                    let _ = events.send(EngineEvent::Info(format!("Vertical clip saved: {}", vpath.display())));
+                    let _ = events.try_send(EngineEvent::Info(format!("Vertical clip saved: {}", vpath.display())));
                 }
                 Err(e) => {
-                    let _ = events.send(EngineEvent::Error(format!("Vertical clip failed: {e}")));
+                    let _ = events.try_send(EngineEvent::Error(format!("Vertical clip failed: {e}")));
                 }
             });
         }
         thread::spawn(move || {
             match ferrous_output::save_replay(&ffmpeg, &dir, secs, REPLAY_SEGMENT_SECS, &path, fmt) {
                 Ok(()) => {
-                    let _ = events.send(EngineEvent::Info(format!("Replay saved: {}", path.display())));
+                    let _ = events.try_send(EngineEvent::Info(format!("Replay saved: {}", path.display())));
                 }
                 Err(e) => {
-                    let _ = events.send(EngineEvent::Error(format!("Replay save failed: {e}")));
+                    let _ = events.try_send(EngineEvent::Error(format!("Replay save failed: {e}")));
                 }
             }
         });
@@ -787,7 +788,7 @@ impl Engine {
                 if let Err(e) = out.stop() {
                     log::warn!("stream stop: {e}");
                 }
-                let _ = events.send(EngineEvent::Info("Stream ended".into()));
+                let _ = events.try_send(EngineEvent::Info("Stream ended".into()));
             });
         }
     }
@@ -1022,13 +1023,16 @@ const FRAME_HISTORY: usize = 600;
 fn render_loop(shared: Arc<Shared>, audio: Arc<AudioEngine>, video: ferrous_core::VideoSettings, ffmpeg_path: PathBuf) {
     let fps = video.fps.clamp(1, 240);
     let period = Duration::from_secs_f64(1.0 / fps as f64);
+    let gpu_capture = video.gpu_capture && video.renderer != ferrous_core::RendererMode::Cpu;
+    ferrous_capture::set_gpu_capture(gpu_capture);
+    ferrous_render::prefer_dx12(gpu_capture);
     let (mut compositor, gpu_error) = Renderer::new(
         video.base_width,
         video.base_height,
         video.renderer != ferrous_core::RendererMode::Cpu,
     );
     if let Some(e) = gpu_error {
-        let _ = shared.events.send(EngineEvent::Error(format!("GPU compositor unavailable, using CPU: {e}")));
+        let _ = shared.events.try_send(EngineEvent::Error(format!("GPU compositor unavailable, using CPU: {e}")));
     }
     shared.status.lock().renderer = compositor.describe();
     // GPU path: have it convert to NV12 for encoders (when one will use it)
@@ -1101,7 +1105,7 @@ fn render_loop(shared: Arc<Shared>, audio: Arc<AudioEngine>, video: ferrous_core
         // Diff sources against the scenes only when they changed, plus a
         // periodic pass to restart dead sources and retry failed ones.
         if !last_synced.as_ref().is_some_and(|p| Arc::ptr_eq(p, &scenes)) || last_sync.elapsed() >= Duration::from_millis(250) {
-            let program_idx = scenes.current.min(scenes.scenes.len() - 1);
+            let program_idx = scenes.current.min(scenes.scenes.len().saturating_sub(1));
             let mut link_targets: Vec<_> = shared.links.lock().iter().map(|l| l.cfg.target.clone()).collect();
             if shared.multiview.load(Ordering::Relaxed) {
                 link_targets.extend(scenes.scenes.iter().map(|s| ferrous_core::LinkSourceTarget::Scene { name: s.name.clone() }));
@@ -1113,10 +1117,10 @@ fn render_loop(shared: Arc<Shared>, audio: Arc<AudioEngine>, video: ferrous_core
             last_sync = Instant::now();
         }
 
-        let program = scenes.current.min(scenes.scenes.len() - 1);
+        let program = scenes.current.min(scenes.scenes.len().saturating_sub(1));
         if last_program.as_ref().is_some_and(|(idx, _)| *idx != program) {
             let (idx, prev) = last_program.take().unwrap();
-            let from = prev.scenes[idx.min(prev.scenes.len() - 1)].clone();
+            let from = prev.scenes[idx.min(prev.scenes.len().saturating_sub(1))].clone();
             // The scene going live may bring its own transition.
             let cfg = scenes.scenes[program].transition.clone().unwrap_or_else(|| scenes.transition.clone());
             if cfg.kind != ferrous_core::TransitionKind::Cut && cfg.duration_ms > 0 {
@@ -1164,8 +1168,8 @@ fn render_loop(shared: Arc<Shared>, audio: Arc<AudioEngine>, video: ferrous_core
                             match t.stinger.as_mut().and_then(|s| s.latest_frame()) {
                                 Some(sf) => {
                                     let tf = ferrous_core::Transform::fit_to(sf.width, sf.height, video.base_width, video.base_height);
-                                    let mut layers = vec![Layer { frame: &under, transform: ferrous_core::Transform::default() }];
-                                    layers.push(Layer { frame: &sf, transform: tf });
+                                    let mut layers = vec![Layer { frame: &under, transform: ferrous_core::Transform::default(), filters: &[] }];
+                                    layers.push(Layer { frame: &sf, transform: tf, filters: &[] });
                                     compositor.compose(&layers)
                                 }
                                 None => under,
@@ -1178,7 +1182,7 @@ fn render_loop(shared: Arc<Shared>, audio: Arc<AudioEngine>, video: ferrous_core
                                 match picture {
                                     Some(pic) => {
                                         let tf = ferrous_core::Transform::fit_to(pic.width, pic.height, video.base_width, video.base_height);
-                                        compositor.compose(&[Layer { frame: &mixed, transform: ferrous_core::Transform::default() }, Layer { frame: &pic, transform: tf }])
+                                        compositor.compose(&[Layer { frame: &mixed, transform: ferrous_core::Transform::default(), filters: &[] }, Layer { frame: &pic, transform: tf, filters: &[] }])
                                     }
                                     None => mixed,
                                 }
@@ -1440,7 +1444,7 @@ fn sync_links(shared: &Shared, audio: &AudioEngine, settings: &Settings) {
                         }
                     });
                 }
-                let _ = shared.events.send(EngineEvent::Info(format!("Ferrous Link \"{}\" ready on port {}", cfg.name, sender.port)));
+                let _ = shared.events.try_send(EngineEvent::Info(format!("Ferrous Link \"{}\" ready on port {}", cfg.name, sender.port)));
                 links.push(ActiveLink {
                     cfg: cfg.clone(),
                     sender,
@@ -1450,7 +1454,7 @@ fn sync_links(shared: &Shared, audio: &AudioEngine, settings: &Settings) {
                 });
             }
             Err(e) => {
-                let _ = shared.events.send(EngineEvent::Error(format!("Ferrous Link \"{}\" failed: {e}", cfg.name)));
+                let _ = shared.events.try_send(EngineEvent::Error(format!("Ferrous Link \"{}\" failed: {e}", cfg.name)));
             }
         }
     }
@@ -1507,7 +1511,7 @@ fn compose_nested(
 ) -> VideoFrame {
     // One slot per drawn item, in order; filtered frames are dropped into
     // their slots once every chain has run.
-    let mut slots: Vec<(VideoFrame, ferrous_core::Transform)> = Vec::new();
+    let mut slots: Vec<(VideoFrame, ferrous_core::Transform, Vec<ferrous_render::filters::GpuFilter>)> = Vec::new();
     let mut ids: Vec<u64> = Vec::new();
     let mut jobs: Vec<FilterJob<'_>> = Vec::new();
     for item in &scene.items {
@@ -1521,23 +1525,37 @@ fn compose_nested(
                     if let Some(c) = cache.get_mut(&item.id) {
                         c.size = (f.width, f.height);
                     }
-                    slots.push((f, item.transform));
+                    slots.push((f, item.transform, Vec::new()));
                     ids.push(item.id);
                 }
             }
             continue;
         }
         let t = Instant::now();
-        let latest = item_frame(cache, item);
+        // Nested scenes compose on the CPU, so only the top level may take GPU-resident frames.
+        let gpu = depth == 0 && compositor.takes_gpu_frames() && gpu_resident_ok(&item.video_filters);
+        let mut latest = item_frame_with(cache, item, gpu);
+        if latest.as_ref().is_some_and(|f| f.gpu.is_some() && !compositor.accepts_gpu_frame(f)) {
+            latest = item_frame_with(cache, item, false);
+        }
         if let Some(c) = cache.get_mut(&item.id) {
             if let Some(f) = latest {
                 c.size = (f.width, f.height);
+                let mut plan = Vec::new();
                 if item.video_filters.iter().any(|f| f.enabled) {
-                    jobs.push(FilterJob { slot: slots.len(), id: item.id, frame: f.clone(), filters: &item.video_filters });
+                    // On the GPU the filters run as passes over the layer's texture; a chain with a
+                    // plugin (CPU only), or the CPU compositor, filters the frame here instead.
+                    match compositor.is_gpu().then(|| c.filters.plan(&f, &item.video_filters)).flatten() {
+                        Some((p, err)) => {
+                            c.filter_error = err;
+                            plan = p;
+                        }
+                        None => jobs.push(FilterJob { slot: slots.len(), id: item.id, frame: f.clone(), filters: &item.video_filters }),
+                    }
                 } else {
                     c.filter_error = None;
                 }
-                slots.push((f, item.transform));
+                slots.push((f, item.transform, plan));
                 ids.push(item.id);
             }
             c.acc.0 += t.elapsed().as_secs_f32() * 1000.0;
@@ -1548,7 +1566,7 @@ fn compose_nested(
         slots[slot].0 = out;
     }
     let frames = slots;
-    let layers: Vec<Layer<'_>> = frames.iter().map(|(frame, transform)| Layer { frame, transform: *transform }).collect();
+    let layers: Vec<Layer<'_>> = frames.iter().map(|(frame, transform, plan)| Layer { frame, transform: *transform, filters: plan }).collect();
     if depth > 0 {
         compositor.compose_transparent(&layers)
     } else {
@@ -1560,7 +1578,20 @@ fn compose_nested(
 
 /// An item's newest raw frame. A clone reads its original's frame; cloning a
 /// clone (or yourself) shows nothing, which also rules out cycles.
+#[cfg(test)]
 fn item_frame(cache: &mut HashMap<u64, CachedSource>, item: &ferrous_core::SceneItem) -> Option<VideoFrame> {
+    item_frame_with(cache, item, false)
+}
+
+/// Whether the GPU compositor can run all of an item's filters without the picture on the CPU
+/// (plugins and background removal read pixels, so they need CPU frames).
+fn gpu_resident_ok(filters: &ferrous_core::filters::VideoFilters) -> bool {
+    use ferrous_core::filters::VideoFilter;
+    !filters.iter().any(|f| f.enabled && matches!(f.filter, VideoFilter::Plugin { .. } | VideoFilter::BackgroundRemoval { .. }))
+}
+
+/// [`item_frame`], preferring a frame that lives only on the GPU when `gpu` is set and the source has one.
+fn item_frame_with(cache: &mut HashMap<u64, CachedSource>, item: &ferrous_core::SceneItem, gpu: bool) -> Option<VideoFrame> {
     let id = match &item.source {
         SourceConfig::Clone { source } => {
             if *source == item.id || matches!(cache.get(source)?.config, SourceConfig::Clone { .. }) {
@@ -1570,7 +1601,13 @@ fn item_frame(cache: &mut HashMap<u64, CachedSource>, item: &ferrous_core::Scene
         }
         _ => item.id,
     };
-    cache.get_mut(&id)?.source.as_mut()?.latest_frame()
+    let src = cache.get_mut(&id)?.source.as_mut()?;
+    if gpu {
+        if let Some(f) = src.latest_gpu_frame() {
+            return Some(f);
+        }
+    }
+    src.latest_frame()
 }
 
 /// Adds a composition's per-layer costs to each item's frame accumulator.
@@ -1592,7 +1629,7 @@ fn compose_vertical(
     canvas: (u32, u32),
     main: (u32, u32),
 ) -> VideoFrame {
-    let mut slots: Vec<(VideoFrame, ferrous_core::Transform)> = Vec::new();
+    let mut slots: Vec<(VideoFrame, ferrous_core::Transform, Vec<ferrous_render::filters::GpuFilter>)> = Vec::new();
     let mut ids: Vec<u64> = Vec::new();
     let mut jobs: Vec<FilterJob<'_>> = Vec::new();
     for item in &scene.items {
@@ -1600,15 +1637,28 @@ fn compose_vertical(
         let frame = if let SourceConfig::Scene { name } = &item.source {
             all.scenes.iter().find(|s| s.name == *name && s.name != scene.name).map(|inner| compose_nested(inner, Some(all), cache, compositor, 1))
         } else {
-            item_frame(cache, item).inspect(|_| filtered = item.video_filters.iter().any(|f| f.enabled))
+            let gpu = compositor.takes_gpu_frames() && gpu_resident_ok(&item.video_filters);
+            let mut f = item_frame_with(cache, item, gpu);
+            if f.as_ref().is_some_and(|f| f.gpu.is_some() && !compositor.accepts_gpu_frame(f)) {
+                f = item_frame_with(cache, item, false);
+            }
+            f.inspect(|_| filtered = item.video_filters.iter().any(|f| f.enabled))
         };
         let Some(f) = frame else { continue };
         let (t, visible) = scene.vertical_layout(item, canvas, main);
         if visible {
+            let mut plan = Vec::new();
             if filtered {
-                jobs.push(FilterJob { slot: slots.len(), id: item.id, frame: f.clone(), filters: &item.video_filters });
+                let planned = if compositor.is_gpu() { cache.get_mut(&item.id).and_then(|c| c.filters.plan(&f, &item.video_filters).map(|(p, err)| (c, p, err))) } else { None };
+                match planned {
+                    Some((c, p, err)) => {
+                        c.filter_error = err;
+                        plan = p;
+                    }
+                    None => jobs.push(FilterJob { slot: slots.len(), id: item.id, frame: f.clone(), filters: &item.video_filters }),
+                }
             }
-            slots.push((f, t));
+            slots.push((f, t, plan));
             ids.push(item.id);
         }
     }
@@ -1616,7 +1666,7 @@ fn compose_vertical(
         slots[slot].0 = out;
     }
     let frames = slots;
-    let layers: Vec<Layer<'_>> = frames.iter().map(|(frame, transform)| Layer { frame, transform: *transform }).collect();
+    let layers: Vec<Layer<'_>> = frames.iter().map(|(frame, transform, plan)| Layer { frame, transform: *transform, filters: plan }).collect();
     let out = compositor.compose_timed(&layers);
     attribute(cache, &ids, &out);
     out.frame
@@ -1735,7 +1785,7 @@ fn supervise(shared: &Shared, audio: &AudioEngine) {
         if e.output.as_ref().is_some_and(|out| !out.is_running()) {
             let out = e.output.take().unwrap();
             let err = out.stats.error().unwrap_or_else(|| "connection closed".into());
-            let _ = shared.events.send(EngineEvent::Error(format!("{} disconnected: {err}", e.name)));
+            let _ = shared.events.try_send(EngineEvent::Error(format!("{} disconnected: {err}", e.name)));
             e.retry_at = Some(Instant::now() + RECONNECT_DELAY);
         }
         if e.output.is_none() && e.retry_at.is_some_and(|t| Instant::now() >= t) {
@@ -1744,12 +1794,12 @@ fn supervise(shared: &Shared, audio: &AudioEngine) {
                 Ok(out) => {
                     e.output = Some(out);
                     e.retry_at = None;
-                    let _ = shared.events.send(EngineEvent::Info(format!("{}: reconnecting (attempt {})…", e.name, e.attempts)));
+                    let _ = shared.events.try_send(EngineEvent::Info(format!("{}: reconnecting (attempt {})…", e.name, e.attempts)));
                 }
                 Err(_) if e.attempts < MAX_RECONNECTS => e.retry_at = Some(Instant::now() + RECONNECT_DELAY),
                 Err(err) => {
                     e.retry_at = None;
-                    let _ = shared.events.send(EngineEvent::Error(format!("{}: gave up reconnecting: {err}", e.name)));
+                    let _ = shared.events.try_send(EngineEvent::Error(format!("{}: gave up reconnecting: {err}", e.name)));
                 }
             }
         }
@@ -1758,12 +1808,12 @@ fn supervise(shared: &Shared, audio: &AudioEngine) {
     if o.replay.as_ref().is_some_and(|(r, _)| !r.is_running()) {
         let (r, _) = o.replay.take().unwrap();
         let err = r.stats.error().unwrap_or_else(|| "FFmpeg exited".into());
-        let _ = shared.events.send(EngineEvent::Error(format!("Replay buffer stopped: {err}")));
+        let _ = shared.events.try_send(EngineEvent::Error(format!("Replay buffer stopped: {err}")));
     }
     if let Some(rec) = &o.record {
         if !rec.is_running() {
             let err = rec.stats.error().unwrap_or_else(|| "FFmpeg exited".into());
-            let _ = shared.events.send(EngineEvent::Error(format!("Recording stopped: {err}")));
+            let _ = shared.events.try_send(EngineEvent::Error(format!("Recording stopped: {err}")));
             o.record = None;
             o.record_path = None;
         }
@@ -1771,7 +1821,7 @@ fn supervise(shared: &Shared, audio: &AudioEngine) {
     if let Some(stream) = &o.stream {
         if !stream.is_running() {
             let err = stream.stats.error().unwrap_or_else(|| "connection closed".into());
-            let _ = shared.events.send(EngineEvent::Error(format!("Stream disconnected: {err}")));
+            let _ = shared.events.try_send(EngineEvent::Error(format!("Stream disconnected: {err}")));
             o.stream = None;
             let cfg = shared.stream_config.lock().clone();
             match (cfg, o.stream_retry.as_mut()) {
@@ -1792,7 +1842,7 @@ fn supervise(shared: &Shared, audio: &AudioEngine) {
                 let n = retry.attempts;
                 match Output::start(retry.config.clone(), subscribe_all(audio, &retry.config)) {
                     Ok(out) => {
-                        let _ = shared.events.send(EngineEvent::Info(format!("Reconnecting (attempt {n})…")));
+                        let _ = shared.events.try_send(EngineEvent::Info(format!("Reconnecting (attempt {n})…")));
                         o.stream = Some(out);
                         // Stay in retry mode until it has survived a while.
                         if let Some(r) = o.stream_retry.as_mut() {
@@ -1800,7 +1850,7 @@ fn supervise(shared: &Shared, audio: &AudioEngine) {
                         }
                     }
                     Err(e) => {
-                        let _ = shared.events.send(EngineEvent::Error(format!("Reconnect failed: {e}")));
+                        let _ = shared.events.try_send(EngineEvent::Error(format!("Reconnect failed: {e}")));
                         if let Some(r) = o.stream_retry.as_mut() {
                             r.at = Instant::now() + RECONNECT_DELAY;
                         }
@@ -1808,7 +1858,7 @@ fn supervise(shared: &Shared, audio: &AudioEngine) {
                 }
                 if n >= MAX_RECONNECTS && o.stream.is_none() {
                     o.stream_retry = None;
-                    let _ = shared.events.send(EngineEvent::Error("Gave up reconnecting".into()));
+                    let _ = shared.events.try_send(EngineEvent::Error("Gave up reconnecting".into()));
                 }
             }
         }
@@ -1816,7 +1866,7 @@ fn supervise(shared: &Shared, audio: &AudioEngine) {
         // Reconnected stream has been stable past its probation window.
         if Instant::now() >= r.at {
             o.stream_retry = None;
-            let _ = shared.events.send(EngineEvent::Info("Stream reconnected".into()));
+            let _ = shared.events.try_send(EngineEvent::Info("Stream reconnected".into()));
         }
     }
 }
@@ -1862,6 +1912,48 @@ mod idle_tests {
         let mut c2 = c.clone();
         c2.add_item_to(1, "self", SourceConfig::Scene { name: "B".into() });
         let _ = shown_items(&c2, 1, None, None, &[]);
+    }
+
+    /// A filtered source composes to the same picture whether its filters run as GPU passes or on the
+    /// CPU (the GPU path is only taken on a real or forced GPU; skipped when there is none).
+    #[test]
+    fn filtered_sources_compose_the_same_on_gpu_and_cpu() {
+        use ferrous_core::filters::{Filter, VideoFilter};
+        std::env::set_var("FERROUS_FORCE_GPU", "1");
+        let (mut gpu, err) = Renderer::new(128, 72, true);
+        if err.is_some() || !gpu.is_gpu() {
+            eprintln!("no GPU; skipping");
+            return;
+        }
+        let (mut cpu, _) = Renderer::new(128, 72, false);
+        let mut c = SceneCollection::default();
+        c.scenes = vec![ferrous_core::Scene::new("A")];
+        // Static sources, so both renderers see exactly the same frames: a skin-toned card through colour
+        // correction, with a green card keyed out on top of it.
+        let skin = c.add_item_to(0, "skin", SourceConfig::Color { bgra: [120, 150, 220, 255], width: 128, height: 72 });
+        let green = c.add_item_to(0, "green", SourceConfig::Color { bgra: [30, 200, 40, 255], width: 64, height: 72 });
+        for it in c.scenes[0].items.iter_mut() {
+            if it.id == skin {
+                it.video_filters = vec![Filter { enabled: true, filter: VideoFilter::ColorCorrection { gamma: 0.2, contrast: 0.2, brightness: 0.05, saturation: 0.5, hue_shift: 30.0, opacity: 0.9 } }];
+            } else if it.id == green {
+                it.video_filters = vec![Filter { enabled: true, filter: VideoFilter::ChromaKey { key_rgb: [0, 255, 0], similarity: 400, smoothness: 80, spill: 100 } }];
+            }
+        }
+        let env = SourceEnv { fps: 60, ffmpeg: PathBuf::from("ffmpeg"), mixer: Arc::new(Mixer::default()) };
+        let mut cache = HashMap::new();
+        sync_sources(&mut cache, &c, &env, &shown_items(&c, 0, None, None, &[]));
+        for it in c.scenes[0].items.clone() {
+            for _ in 0..100 {
+                if item_frame(&mut cache, &it).is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let a = compose_nested(&c.scenes[0], Some(&c), &mut cache, &mut gpu, 0);
+        let b = compose_nested(&c.scenes[0], Some(&c), &mut cache, &mut cpu, 0);
+        let worst = a.data.iter().zip(b.data.iter()).map(|(x, y)| (*x as i32 - *y as i32).abs()).max().unwrap();
+        assert!(worst <= 4, "GPU and CPU filtered scenes differ by {worst}");
     }
 
     #[test]

@@ -52,6 +52,7 @@ const INDEX: &[(&str, Tab, &str)] = &[
     ("Theme and colours", Tab::General, "appearance look dark light skin"),
     ("Glass effects", Tab::General, "blur translucent transparency"),
     ("Animated backgrounds", Tab::General, "rain stars motion animation"),
+    ("Window frame rate", Tab::General, "fps cap limit redraw refresh 60 120 144 240 gpu"),
     ("Interface size and zoom", Tab::General, "accessibility bigger smaller text scale ctrl"),
     ("High-contrast colours", Tab::General, "accessibility contrast low vision black white"),
     ("Colour-blind-friendly level meters", Tab::General, "accessibility colorblind red green hatch"),
@@ -75,6 +76,7 @@ const INDEX: &[(&str, Tab, &str)] = &[
     ("Vertical canvas", Tab::Video, "tiktok shorts reels 9:16 portrait"),
     ("Color conversion", Tab::Video, "yuv nv12 ffmpeg ferrous"),
     ("GPU readback and priority", Tab::Video, "lag latency game pipelined"),
+    ("GPU capture", Tab::Video, "gpu resident capture shared texture cpu copy"),
     ("Desktop and microphone devices", Tab::Audio, "input output speaker wasapi"),
     ("Audio delay (sync offset)", Tab::Audio, "lip sync latency"),
     ("Hotkeys", Tab::Hotkeys, "shortcut keyboard keys bind"),
@@ -537,6 +539,10 @@ impl SettingsWindow {
             ui.checkbox(&mut v.gpu_priority, "Schedule Ferrous's GPU work ahead of other programs")
                 .on_hover_text("Helps when a game uses the whole GPU and Ferrous reports rendering lag (frames missed in the Stats dock). Works best when Ferrous runs as administrator, and with Windows Game Mode on. Takes effect on restart.");
             ui.end_row();
+            crate::widgets::row_label(ui, "GPU capture");
+            ui.checkbox(&mut v.gpu_capture, "Keep display and game capture on the GPU (experimental)")
+                .on_hover_text("Skips the copy of every captured frame to system memory: the picture goes from the capture straight into the GPU renderer. It lowers CPU use and memory traffic, most at 1440p/4K and high frame rates. Sources that need the pixels on the CPU (plugin filters, background removal, nested scenes) use the normal path automatically, and so does everything if your graphics setup can't share textures. Needs the GPU renderer. Takes effect on restart.");
+            ui.end_row();
         });
         // Encoders want even dimensions for 4:2:0 chroma.
         v.output_width &= !1;
@@ -839,6 +845,16 @@ impl SettingsWindow {
                 }
             });
             ui.label(RichText::new("Rain, drifting glows, twinkling stars. Costs a little GPU; Off is fully static.").small().color(theme::muted()));
+        });
+        ui.horizontal(|ui| {
+            crate::widgets::row_label(ui, "Window frame rate");
+            let label = |v: u32| if v == 0 { "Unlimited".to_string() } else { format!("{v} fps") };
+            egui::ComboBox::from_id_salt("ui_max_fps").selected_text(label(self.draft.ui.max_fps)).show_ui(ui, |ui| {
+                for v in [30, 60, 120, 144, 240, 0] {
+                    ui.selectable_value(&mut self.draft.ui.max_fps, v, label(v));
+                }
+            });
+            ui.label(RichText::new("The most times a second Ferrous redraws its own window. It doesn't change your video's frame rate. Lower uses less GPU.").small().color(theme::muted()));
         });
         ui.add_space(10.0);
         crate::widgets::section_title(ui, "Accessibility");

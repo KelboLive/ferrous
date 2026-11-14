@@ -4,7 +4,7 @@
 
 # Ferrous
 
-![Ferrous](docs/screenshot.png)
+![Ferrous in Advanced mode with the Performance Monitor open](docs/screenshot.png)
 
 **A lean, fast recording and streaming studio for Windows, written in Rust: a modern successor to OBS Studio.**
 
@@ -15,9 +15,9 @@ through plugins for things people use every day. Ferrous has one aim: **capture,
 record and stream with as little overhead as possible, and still give you the cleanest, smoothest picture
 your hardware can produce.** In practice that means:
 
-- **Low resource use first.** A multi-threaded GPU compositor with a CPU fallback, finished NV12 handed
-  straight to the encoder, memoised static scenes, and no work done for windows or previews you aren't
-  looking at. Every feature is judged against its cost.
+- **Low resource use first.** A multi-threaded GPU compositor (filters included) with a CPU fallback,
+  finished NV12 handed straight to the encoder, optional GPU-resident capture, memoised static scenes, a
+  capped window redraw rate, and no work done for windows or previews you aren't looking at. Every feature is judged against its cost.
 - **Picture quality you can measure.** Every encoder is tuned (two-pass, lookahead, adaptive
   quantisation, 10-bit internals), HDR10 output is built in, and a built-in benchmark compares
   settings by speed *and* quality (SSIM/VMAF) so you pick settings from evidence, not guesses.
@@ -35,6 +35,11 @@ your hardware can produce.** In practice that means:
 
 | | |
 |---|---|
+| **Filters on the GPU** | Chroma key, colour correction, scroll, LUTs and the background-removal mask run as GPU passes in the compositor (shaders compile the first time you use a filter). CPU twins stay as the fallback and are tested to give the same picture. |
+| **GPU-resident capture (experimental)** | Settings → Video → *GPU capture*: display, window and game capture hand each frame to the renderer as a shared texture and skip the copy through system memory. Off by default; it falls back to the normal path by itself for plugin filters, background removal, nested scenes, a different GPU or any error. |
+| **Sharper downscaling** | Layers shrunk by more than about 1.25:1 (a 4K display on a 1080p canvas) are area-averaged, so fine lines and text stop shimmering. 1:1 and enlarged layers cost nothing extra. |
+| **A GPU figure you can trust** | The Performance Monitor reads the card's own utilisation (the same counter RTSS shows) instead of Windows' per-engine counters, which can read far too high. |
+| **Window frame rate** | Settings → General: cap Ferrous's own window at 30/60/120/144/240 fps or unlimited, so it doesn't compete with your game for the GPU. Your video's frame rate is unaffected. |
 | **Recording presets and a speed/quality benchmark** | Save named recording presets (built-in *Max quality*, *Balanced*, *Light*, *Small files* are generated for your encoders). The benchmark encodes the same footage with each setting, then reports speed, bitrate and quality (SSIM/PSNR, or VMAF if your FFmpeg has it) and flags the best quality, best value and lightest settings that still keep up in real time. |
 | **HDR10 output** | SDR sources mapped to 10-bit BT.2020/PQ for HEVC and AV1 (adjustable SDR white level). True HDR capture is planned. |
 | **Tuned encoders** | NVENC two-pass and lookahead, H.264 High profile, AV1 10-bit internals, Quick Sync adaptive I/B, AMF VBAQ, SVT-AV1 visual-quality tune. |
@@ -47,7 +52,7 @@ your hardware can produce.** In practice that means:
 
 | Area | What's included |
 |---|---|
-| **Rendering** | GPU compositor (wgpu: D3D12/Vulkan) with CPU fallback, studio mode, transitions (cut, fade, fade-to-colour, swipe, slide, stinger, **27 luma wipes** or your own wipe image), nested scenes, **source clone** (reuse a live source with its own crop and filters, no second capture), **rotation** (antialiased, with an on-canvas rotate handle) |
+| **Rendering** | GPU compositor (wgpu: D3D12/Vulkan) with the video filters as GPU passes and a CPU fallback, optional GPU-resident capture, studio mode, transitions (cut, fade, fade-to-colour, swipe, slide, stinger, **27 luma wipes** or your own wipe image), nested scenes, **source clone** (reuse a live source with its own crop and filters, no second capture), **rotation** (antialiased, with an on-canvas rotate handle) |
 | **Vertical canvas** | Second 9:16 canvas with its own per-scene layout, for TikTok, Shorts and Reels, alongside the main canvas |
 | **Sources** | Display, window, **game capture** (follows your game, no injection) and **application audio** capture; webcams and capture cards; media files and URLs; images; colour; **text** (from file too); **browser** (headless Edge, transparent); **Ferrous Link**; plugin sources; **OBS plugin sources** (run on your OBS install's libobs); test pattern |
 | **Filters** | Chroma key, colour correction, scroll, LUT; RNNoise noise suppression, gate, compressor, limiter, gain; **VST3 effects** (generic editor, plus the plugin's own editor window); plugin filters |
@@ -66,7 +71,7 @@ your hardware can produce.** In practice that means:
 
 ## Screenshots
 
-All taken from the current build, on a software-rendered virtual display (so the preview is black and there are no audio devices). Everything shown is the real interface.
+All taken from the current build on a Linux virtual display using a software Vulkan driver, so there are no capture sources or audio devices and the GPU figure reads n/a. Everything shown is the real interface.
 
 | | |
 |---|---|
@@ -74,8 +79,9 @@ All taken from the current build, on a software-rendered virtual display (so the
 | ![Pre-flight](docs/screenshots/04-preflight-check.png) **Pre-flight check**: problems in plain words with one-click fixes | ![Templates](docs/screenshots/05-scene-templates.png) Scene templates: Screen, Just chatting, Gameplay, Tutorial, Starting soon |
 | ![Palette](docs/screenshots/06-command-palette.png) **Ctrl+K** finds any action, scene, source type or setting | ![Advanced](docs/screenshots/10-advanced-mode.png) **Advanced mode**: every dock and menu, one click away |
 | ![General](docs/screenshots/07-settings-general.png) Settings → General: themes and accessibility (interface size, high contrast, colour-blind meters, reduce motion) | ![Recording](docs/screenshots/08-settings-recording.png) Settings → Recording: quality profiles and presets |
-| ![Stream](docs/screenshots/09-settings-stream.png) Settings → Stream, with a live "GB per hour / Mbps needed" hint | ![Source menu](docs/screenshots/12-source-context-menu.png) Source right-click menu |
-| ![Scene menu](docs/screenshots/13-scene-context-menu.png) Scene right-click menu | ![Setup](docs/screenshots/01-first-run-setup.png) First-run setup and benchmark |
+| ![Stream](docs/screenshots/09-settings-stream.png) Settings → Stream, with a live "GB per hour / Mbps needed" hint | ![Video](docs/screenshots/11-settings-video.png) Settings → Video: compositor, GPU readback and priority, experimental GPU capture |
+| ![Source menu](docs/screenshots/12-source-context-menu.png) Source right-click menu | ![Scene menu](docs/screenshots/13-scene-context-menu.png) Scene right-click menu |
+| ![Setup](docs/screenshots/01-first-run-setup.png) First-run setup and benchmark | |
 
 ## Architecture
 

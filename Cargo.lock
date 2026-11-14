@@ -1808,6 +1808,7 @@ dependencies = [
  "ron",
  "serde",
  "serde_json",
+ "windows 0.62.2",
  "wry",
 ]
 
@@ -1858,6 +1859,7 @@ dependencies = [
  "serde_json",
  "tungstenite",
  "wasapi",
+ "windows 0.62.2",
  "windows-capture",
 ]
 
@@ -2026,12 +2028,14 @@ dependencies = [
  "pollster 0.4.0",
  "rayon",
  "wgpu",
+ "windows 0.62.2",
 ]
 
 [[package]]
 name = "ferrous-sysmon"
 version = "0.1.0"
 dependencies = [
+ "libloading",
  "log",
  "parking_lot 0.12.5",
  "sysinfo",

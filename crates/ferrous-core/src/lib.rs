@@ -8,6 +8,6 @@ pub mod paths;
 pub mod scene;
 pub mod settings;
 
-pub use frame::{FramePool, VideoFrame};
+pub use frame::{FramePool, SharedFrame, VideoFrame};
 pub use scene::{HandleDrag, Scene, SceneCollection, SceneItem, SourceConfig, TextAlign, Transform, Transition, TransitionDirection, TransitionKind};
 pub use settings::*;

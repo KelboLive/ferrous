@@ -221,8 +221,12 @@ impl Converter {
     pub fn convert(&self, bgra: &[u8], out: &mut Vec<u8>) {
         let (sw, sh) = (self.src.0 as usize, self.src.1 as usize);
         let (dw, dh) = (self.dst.0 as usize, self.dst.1 as usize);
-        assert_eq!(bgra.len(), sw * sh * 4, "input is not {sw}x{sh} BGRA");
         out.resize(self.output_bytes(), 0);
+        if bgra.len() != sw * sh * 4 {
+            // E.g. a GPU-resident frame with no CPU pixels: drop the picture instead of panicking.
+            log::warn!("convert: input is {} bytes, expected {sw}x{sh} BGRA; frame skipped", bgra.len());
+            return;
+        }
         if self.hdr.is_some() {
             self.convert_hdr(bgra, out);
             return;
@@ -297,7 +301,7 @@ impl Converter {
 
     /// SDR BGRA -> 10-bit HDR10 (BT.2020, PQ, limited range).
     fn convert_hdr(&self, bgra: &[u8], out: &mut [u8]) {
-        let t = self.hdr.as_ref().expect("HDR tables");
+        let Some(t) = self.hdr.as_ref() else { return };
         let sw = self.src.0 as usize;
         let (dw, dh) = (self.dst.0 as usize, self.dst.1 as usize);
         let (cw, ch) = (dw / 2, dh / 2);
@@ -500,7 +504,7 @@ mod tests {
             p.copy_from_slice(&[(x * 2) as u8, (y * 3) as u8, ((x ^ y) * 4) as u8, 255]);
         }
         let src = VideoFrame::new(96, 64, px);
-        let out = gpu.compose_into(&[Layer { frame: &src, transform: Transform::default() }], Vec::new(), true);
+        let out = gpu.compose_into(&[Layer { frame: &src, transform: Transform::default(), filters: &[] }], Vec::new(), true);
         let conv = Converter::new((96, 64), (96, 64), YuvLayout::Nv12);
         let ready = conv.ready_made(&out).expect("same size, NV12 layout");
         let mut cpu = Vec::new();

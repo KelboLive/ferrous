@@ -187,6 +187,11 @@ pub struct VideoSettings {
     /// Works best when Ferrous runs as administrator.
     #[serde(default)]
     pub gpu_priority: bool,
+    /// Windows capture keeps the picture on the GPU (shared texture) instead of copying every frame
+    /// to the CPU; the GPU compositor draws it directly. Experimental; Ferrous falls back to the CPU
+    /// copy by itself when it can't.
+    #[serde(default)]
+    pub gpu_capture: bool,
 }
 
 fn yes() -> bool {
@@ -219,7 +224,7 @@ impl Default for VideoSettings {
             vertical: None,
             conversion: ConversionMode::Auto,
             pipelined_readback: true,
-            gpu_priority: false,
+            gpu_priority: false, gpu_capture: false,
         }
     }
 }
@@ -555,6 +560,9 @@ pub struct UiSettings {
     pub tour_done: bool,
     /// Check for common problems when Start Recording / Start Streaming is clicked.
     pub preflight: bool,
+    /// The most times a second the Ferrous window redraws itself; 0 = no limit. Doesn't change the
+    /// video's frame rate, only how often the interface (and its preview) is drawn.
+    pub max_fps: u32,
 }
 
 /// A custom browser dock: a named dock showing a web page, like OBS's
@@ -579,7 +587,7 @@ pub enum SnapGuides {
 
 impl Default for UiSettings {
     fn default() -> Self {
-        Self { docks: Default::default(), hidden_stats: Vec::new(), recent_sources: Vec::new(), perf_current_scene_only: false, setup_done: false, layout: None, saved_layouts: Default::default(), snap_guides: SnapGuides::Zones, lock_layout: false, mixer_vertical: false, custom_docks: Vec::new(), preview_enabled: true, preview_max_fps: 0, layout_rev: 0, theme: "ember".into(), glass: 2, motion: 1, simple_mode: true, advanced_layout: None, ui_scale: 1.0, high_contrast: false, meter_patterns: false, reduce_motion: false, tour_done: false, preflight: true }
+        Self { docks: Default::default(), hidden_stats: Vec::new(), recent_sources: Vec::new(), perf_current_scene_only: false, setup_done: false, layout: None, saved_layouts: Default::default(), snap_guides: SnapGuides::Zones, lock_layout: false, mixer_vertical: false, custom_docks: Vec::new(), preview_enabled: true, preview_max_fps: 0, layout_rev: 0, theme: "ember".into(), glass: 2, motion: 1, simple_mode: true, advanced_layout: None, ui_scale: 1.0, high_contrast: false, meter_patterns: false, reduce_motion: false, tour_done: false, preflight: true, max_fps: 60 }
     }
 }
 
@@ -698,6 +706,7 @@ impl Settings {
         u.ui_scale = if u.ui_scale.is_finite() { u.ui_scale.clamp(0.8, 2.0) } else { 1.0 };
         u.glass = u.glass.min(2);
         u.motion = u.motion.min(2);
+        u.max_fps = if u.max_fps == 0 { 0 } else { u.max_fps.clamp(15, 480) };
         for e in [&mut self.stream.encoder, &mut self.record.encoder] {
             e.bitrate_kbps = e.bitrate_kbps.clamp(100, 500_000);
             e.keyframe_interval_secs = e.keyframe_interval_secs.clamp(1, 20);

@@ -23,4 +23,5 @@ base64.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-capture.workspace = true
+windows.workspace = true
 wasapi.workspace = true

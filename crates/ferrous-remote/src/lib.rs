@@ -115,7 +115,8 @@ impl RemoteServer {
                 match listener.accept() {
                     Ok((stream, addr)) => {
                         log::info!("remote client connected from {addr}");
-                        let (tx, rx) = crossbeam_channel::unbounded();
+                        // Bounded per client: a stalled client drops updates instead of growing memory.
+                        let (tx, rx) = crossbeam_channel::bounded(256);
                         c2.lock().push(Client { tx });
                         let (calls, wake, password, stop, n) = (calls.clone(), wake.clone(), password.clone(), s2.clone(), n2.clone());
                         thread::spawn(move || {
@@ -148,7 +149,7 @@ impl RemoteServer {
     /// Broadcasts an event (op 5) to subscribed clients.
     pub fn emit(&self, event_type: &str, event_intent: u64, data: Value) {
         let msg = json!({ "op": 5, "d": { "eventType": event_type, "eventIntent": event_intent, "eventData": data } }).to_string();
-        self.clients.lock().retain(|c| c.tx.send((event_intent, msg.clone())).is_ok());
+        self.clients.lock().retain(|c| !matches!(c.tx.try_send((event_intent, msg.clone())), Err(crossbeam_channel::TrySendError::Disconnected(_))));
     }
 }
 

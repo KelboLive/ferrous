@@ -7,6 +7,8 @@
 
 #[cfg(windows)]
 mod gpu_win;
+#[cfg(windows)]
+mod nvml;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -74,6 +76,12 @@ impl SystemMonitor {
                 let mut sys = System::new();
                 let mut disks = Disks::new_with_refreshed_list();
                 let own_pid = sysinfo::get_current_pid().ok();
+                // Opening NVIDIA's and Windows' GPU counters while the renderer is creating its own GPU
+                // device has crashed the driver on some machines, so wait until start-up is over.
+                #[cfg(windows)]
+                std::thread::sleep(Duration::from_secs(5));
+                #[cfg(windows)]
+                let nvml = nvml::Nvml::new();
                 #[cfg(windows)]
                 let mut gpu = gpu_win::GpuCounters::new().map_err(|e| log::info!("GPU counters unavailable: {e}")).ok();
                 let mut tick = 0u32;
@@ -108,7 +116,9 @@ impl SystemMonitor {
                     };
                     #[cfg(windows)]
                     if let Some(g) = &gpu_sample {
-                        snap.gpu = Some(g.total);
+                        // The card's own figure when the driver gives one; Windows' per-engine counters
+                        // (g.total) read far higher than the card is really busy.
+                        snap.gpu = Some(nvml.as_ref().and_then(|n| n.percent()).unwrap_or(g.total));
                         snap.vram_used = Some(g.vram_total);
                     }
                     if tick.is_multiple_of(5) {
@@ -158,23 +168,38 @@ pub fn parse_gpu_instance(name: &str) -> Option<(u32, String)> {
     Some((pid, engtype))
 }
 
-/// Combines per-instance utilisation into per-process and system GPU %,
-/// the way Task Manager does: sum per engine type, report the busiest type.
+/// Combines per-instance utilisation into per-process and system GPU %, the way Task Manager does: an
+/// engine is one hardware queue (an adapter plus an engine index), the processes using it add up on
+/// that engine, and the figure reported is the busiest single engine. Adding up different engines
+/// (a card has many 3D queues, and every adapter has its own) would read far above what is busy.
 pub fn aggregate_gpu(samples: &[(String, f64)]) -> (HashMap<u32, f32>, f32) {
-    let mut per_pid_type: HashMap<(u32, String), f64> = HashMap::new();
-    let mut per_type: HashMap<String, f64> = HashMap::new();
+    aggregate_gpu_on(samples, None)
+}
+
+/// The adapter an instance name belongs to, e.g. `luid_0x00000000_0x0000F1B5`.
+pub fn luid_of(name: &str) -> Option<String> {
+    let rest = &name[name.find("luid_")?..];
+    let mut parts = rest.split('_');
+    Some(format!("{}_{}_{}", parts.next()?, parts.next()?, parts.next()?))
+}
+
+/// [`aggregate_gpu`] counting only `adapter`'s engines (all adapters when `None`): a machine also lists
+/// the software "Basic Render Driver" and any integrated GPU, whose load isn't the graphics card's.
+pub fn aggregate_gpu_on(samples: &[(String, f64)], adapter: Option<&str>) -> (HashMap<u32, f32>, f32) {
+    let mut per_pid: HashMap<u32, HashMap<String, f64>> = HashMap::new();
+    let mut per_engine: HashMap<String, f64> = HashMap::new();
     for (name, v) in samples {
-        if let Some((pid, ty)) = parse_gpu_instance(name) {
-            *per_pid_type.entry((pid, ty.clone())).or_default() += v;
-            *per_type.entry(ty).or_default() += v;
+        let Some((pid, _)) = parse_gpu_instance(name) else { continue };
+        if adapter.is_some_and(|a| luid_of(name).as_deref() != Some(a)) {
+            continue;
         }
+        // Everything after "pid_<n>_" names the engine.
+        let engine = name.splitn(3, '_').nth(2).unwrap_or("").to_string();
+        *per_pid.entry(pid).or_default().entry(engine.clone()).or_default() += v;
+        *per_engine.entry(engine).or_default() += v;
     }
-    let mut per_pid: HashMap<u32, f32> = HashMap::new();
-    for ((pid, _), v) in per_pid_type {
-        let e = per_pid.entry(pid).or_default();
-        *e = e.max(v as f32);
-    }
-    let total = per_type.values().cloned().fold(0.0, f64::max).min(100.0) as f32;
+    let per_pid = per_pid.into_iter().map(|(pid, e)| (pid, e.values().cloned().fold(0.0, f64::max).min(100.0) as f32)).collect();
+    let total = per_engine.values().cloned().fold(0.0, f64::max).min(100.0) as f32;
     (per_pid, total)
 }
 
@@ -194,10 +219,21 @@ mod tests {
             ("pid_10_luid_0x0_0x1_phys_0_eng_3_engtype_VideoEncode".to_string(), 40.0),
             ("pid_22_luid_0x0_0x1_phys_0_eng_0_engtype_3D".to_string(), 30.0),
         ];
+        // Many queues each lightly used must not add up to a busy GPU.
+        let spread: Vec<(String, f64)> = (0..8).map(|i| (format!("pid_7_luid_0x0_0x1_phys_0_eng_{i}_engtype_3D"), 8.0)).collect();
+        let (spread_pid, spread_total) = aggregate_gpu(&spread);
+        assert_eq!((spread_pid[&7], spread_total), (8.0, 8.0));
+        // A busy software adapter doesn't count towards the graphics card.
+        let two = vec![
+            ("pid_1_luid_0x0_0xAAAA_phys_0_eng_0_engtype_3D".to_string(), 69.0),
+            ("pid_2_luid_0x0_0xBBBB_phys_0_eng_0_engtype_3D".to_string(), 3.0),
+        ];
+        assert_eq!(luid_of(&two[0].0).as_deref(), Some("luid_0x0_0xAAAA"));
+        assert_eq!(aggregate_gpu_on(&two, Some("luid_0x0_0xBBBB")).1, 3.0);
         let (per_pid, total) = aggregate_gpu(&samples);
         assert_eq!(per_pid[&10], 40.0, "busiest engine for pid 10 (encoder)");
         assert_eq!(per_pid[&22], 30.0);
-        assert_eq!(total, 55.0, "3D engine sum 20+5+30 beats encode 40");
+        assert_eq!(total, 50.0, "3D engine 0 carries 20+30 from two processes; engine 1's 5 is a different queue");
     }
 
     #[test]

@@ -125,6 +125,8 @@ pub struct FerrousApp {
     saved_scenes: SceneCollection,
     history: crate::history::History,
     last_scene_save: Instant,
+    ui_rate: Option<(Instant, u64)>,
+    last_ui_frame: Option<Instant>,
     selected: Option<u64>,
     preview_tex: Option<TextureHandle>,
     preview_serial: u64,
@@ -227,6 +229,8 @@ impl FerrousApp {
             scenes,
             settings,
             last_scene_save: Instant::now(),
+            ui_rate: None,
+            last_ui_frame: None,
             selected: None,
             preview_tex: None,
             preview_serial: 0,
@@ -488,6 +492,27 @@ impl FerrousApp {
         // themselves, and docks that animate schedule their own repaints;
         // this slow tick only keeps clocks and status text current.
         ctx.request_repaint_after(Duration::from_millis(250));
+        self.log_ui_rate(ctx);
+    }
+
+    /// Writes how fast the window is being redrawn to the log every 15 s (a diagnostic for GPU use).
+    fn log_ui_rate(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let passes = ctx.cumulative_pass_nr();
+        let (t0, p0) = *self.ui_rate.get_or_insert((now, passes));
+        let dt = now.duration_since(t0).as_secs_f32();
+        if dt >= 15.0 {
+            let size = ctx.content_rect().size();
+            log::info!(
+                "UI redraws: {:.1}/s; window {:.0}x{:.0} points at {:.2}x; fonts atlas {:?}",
+                (passes - p0) as f32 / dt,
+                size.x,
+                size.y,
+                ctx.pixels_per_point(),
+                ctx.fonts(|f| f.font_image_size())
+            );
+            self.ui_rate = Some((now, passes));
+        }
     }
 
     // ------------------------------------------------------------- top bar
@@ -3545,6 +3570,17 @@ impl eframe::App for FerrousApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // The window redraws at most `max_fps` times a second, however many things ask for a repaint
+        // (preview frames, meters, input): on a 240 Hz display it otherwise drew ~190 frames a second.
+        if self.settings.ui.max_fps > 0 {
+            if let Some(last) = self.last_ui_frame {
+                let min_frame = Duration::from_secs_f64(1.0 / f64::from(self.settings.ui.max_fps));
+                if let Some(wait) = min_frame.checked_sub(last.elapsed()) {
+                    std::thread::sleep(wait);
+                }
+            }
+        }
+        self.last_ui_frame = Some(Instant::now());
         let ctx = ui.ctx().clone();
         let (tid, tglass, tmotion) = match self.settings_win.theme_preview() {
             Some((i, g, m)) => (i.to_string(), g, m),

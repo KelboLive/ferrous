@@ -16,7 +16,7 @@ fn program_reaches_the_camera() {
     let path = ferrous_vcam::unix_path();
     let _ = std::fs::remove_file(&path);
     let mut settings = Settings::default();
-    settings.video = VideoSettings { base_width: 640, base_height: 360, output_width: 640, output_height: 360, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false };
+    settings.video = VideoSettings { base_width: 640, base_height: 360, output_width: 640, output_height: 360, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false };
     settings.audio.desktop_enabled = false;
     settings.audio.mic_enabled = false;
     let mut scenes = SceneCollection::default();

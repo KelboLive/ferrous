@@ -68,6 +68,7 @@ egui_stack = { version = "0.25", features = ["serde"] }
 ron = "0.12"
 rfd = "0.15"
 windows-capture = "2.0"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Security", "Win32_Graphics_Direct3D11", "Win32_Graphics_Direct3D12", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
 wgpu = "30"
 wasapi = "0.27"
 fontdue = "0.9"

@@ -20,6 +20,8 @@ pub struct GpuCounters {
     query: PDH_HQUERY,
     engine: PDH_HCOUNTER,
     memory: PDH_HCOUNTER,
+    adapters: Option<PDH_HCOUNTER>,
+    last_report: std::time::Instant,
 }
 
 // The PDH handles are only used from the sysmon thread.
@@ -66,8 +68,10 @@ impl GpuCounters {
             let mut memory = PDH_HCOUNTER::default();
             check(PdhAddEnglishCounterW(query, w!("\\GPU Process Memory(*)\\Dedicated Usage"), 0, &mut memory), "GPU memory counter")?;
             // Rate counters need two collections before the first value.
+            let mut adapters = PDH_HCOUNTER::default();
+            let adapters = (PdhAddEnglishCounterW(query, w!("\\GPU Adapter Memory(*)\\Dedicated Usage"), 0, &mut adapters) == 0).then_some(adapters);
             let _ = PdhCollectQueryData(query);
-            Ok(Self { query, engine, memory })
+            Ok(Self { query, engine, memory, adapters, last_report: std::time::Instant::now() - std::time::Duration::from_secs(60) })
         }
     }
 
@@ -76,7 +80,18 @@ impl GpuCounters {
             if PdhCollectQueryData(self.query) != 0 {
                 return None;
             }
-            let (per_pid, total) = crate::aggregate_gpu(&read_array(self.engine, false));
+            let engines = read_array(self.engine, false);
+            // The graphics card is the adapter with the most video memory in use.
+            let main = self.adapters.and_then(|c| {
+                read_array(c, true).into_iter().filter_map(|(n, v)| crate::luid_of(&n).map(|l| (l, v))).max_by(|a, b| a.1.total_cmp(&b.1)).map(|(l, _)| l)
+            });
+            let (per_pid, total) = crate::aggregate_gpu_on(&engines, main.as_deref());
+            if total >= 30.0 && self.last_report.elapsed() >= std::time::Duration::from_secs(30) {
+                self.last_report = std::time::Instant::now();
+                let mut top: Vec<_> = engines.iter().filter(|(_, v)| *v > 1.0).collect();
+                top.sort_by(|a, b| b.1.total_cmp(&a.1));
+                log::debug!("GPU reads {total:.0}% (main adapter {main:?}); busiest engine instances: {:?}", top.into_iter().take(6).collect::<Vec<_>>());
+            }
             let mut vram_per_pid: HashMap<u32, u64> = HashMap::new();
             for (name, v) in read_array(self.memory, true) {
                 if let Some((pid, _)) = crate::parse_gpu_instance(&name) {

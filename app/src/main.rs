@@ -56,6 +56,8 @@ fn main() -> eframe::Result {
         logger.init();
     }
     crash::install_panic_hook();
+    #[cfg(windows)]
+    crash::install_native_crash_log();
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()

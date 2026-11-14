@@ -8,13 +8,14 @@
 pub mod filters;
 pub mod matte;
 mod gpu;
+mod gpufx;
 pub mod transitions;
 
 use ferrous_core::{Transform, VideoFrame};
 use rayon::prelude::*;
 
 pub use ferrous_core::frame::FramePool;
-pub use gpu::GpuCompositor;
+pub use gpu::{prefer_dx12, GpuCompositor};
 
 pub struct Composed {
     pub frame: VideoFrame,
@@ -45,10 +46,21 @@ pub struct Renderer {
     in_flight: Option<Inputs>,
 }
 
-type Inputs = Vec<(std::sync::Arc<Vec<u8>>, u32, u32, Transform)>;
+type Inputs = Vec<(std::sync::Arc<Vec<u8>>, u32, u32, Transform, Vec<filters::GpuFilter>)>;
 
 fn inputs_of(layers: &[Layer<'_>]) -> Inputs {
-    layers.iter().map(|l| (l.frame.data.clone(), l.frame.width, l.frame.height, l.transform)).collect()
+    layers.iter().map(|l| (l.frame.data.clone(), l.frame.width, l.frame.height, l.transform, l.filters.to_vec())).collect()
+}
+
+/// Each filtered layer's frame with its filters run on the CPU (`None` for an unfiltered layer), for
+/// compositors that can't run them as GPU passes.
+fn bake_filters(layers: &[Layer<'_>]) -> Vec<Option<VideoFrame>> {
+    layers.iter().map(|l| (!l.filters.is_empty()).then(|| filters::apply_plan_cpu(l.frame, l.filters))).collect()
+}
+
+/// `layers` drawing the baked frames in place of the originals, with no filters left to run.
+fn baked_layers<'a>(layers: &[Layer<'a>], baked: &'a [Option<VideoFrame>]) -> Vec<Layer<'a>> {
+    layers.iter().zip(baked).map(|(l, b)| Layer { frame: b.as_ref().unwrap_or(l.frame), transform: l.transform, filters: &[] }).collect()
 }
 
 pub enum Backend {
@@ -86,6 +98,20 @@ impl Renderer {
         matches!(self.backend, Backend::Gpu(_))
     }
 
+    /// True when frames that live only in a shared GPU texture can be drawn: the GPU compositor on
+    /// the same adapter as the capture. Turns false for good if opening one fails.
+    pub fn takes_gpu_frames(&self) -> bool {
+        matches!(&self.backend, Backend::Gpu(g) if g.shared_ok())
+    }
+
+    /// Opens a shared GPU frame ahead of drawing it. False means: use the source's CPU frame instead.
+    pub fn accepts_gpu_frame(&mut self, frame: &VideoFrame) -> bool {
+        match &mut self.backend {
+            Backend::Gpu(g) => g.accepts_shared(frame),
+            Backend::Cpu(_) => frame.gpu.is_none(),
+        }
+    }
+
     /// Reads GPU results a frame late, so the CPU never waits on the GPU.
     /// For one steady stream of compositions only (the program output): any
     /// other composition in between would be mistaken for it, so callers
@@ -109,7 +135,9 @@ impl Renderer {
         }
         let out = match &mut self.backend {
             Backend::Cpu(c) => {
-                let (frame, cpu_ms) = c.compose_timed_with(layers, &mut self.pool);
+                let baked = bake_filters(layers);
+                let plain = baked_layers(layers, &baked);
+                let (frame, cpu_ms) = c.compose_timed_with(&plain, &mut self.pool);
                 Composed { frame, cpu_ms, gpu_ms: Vec::new(), gpu_total_ms: None }
             }
             Backend::Gpu(g) => {
@@ -170,7 +198,8 @@ impl Renderer {
         let (w, h) = self.size();
         let mut c = Compositor::new(w, h);
         c.background = [0, 0, 0, 0];
-        let (frame, _) = c.compose_timed_with(layers, &mut self.pool);
+        let baked = bake_filters(layers);
+        let (frame, _) = c.compose_timed_with(&baked_layers(layers, &baked), &mut self.pool);
         self.memo.put(true, layers, &frame);
         if !layers.iter().any(|l| std::sync::Arc::ptr_eq(&l.frame.data, &frame.data)) {
             self.pool.track(&frame);
@@ -223,8 +252,8 @@ impl Memo {
     fn matches(e: &MemoEntry, transparent: bool, layers: &[Layer<'_>]) -> bool {
         e.transparent == transparent
             && e.inputs.len() == layers.len()
-            && e.inputs.iter().zip(layers).all(|((d, w, h, t), l)| {
-                std::sync::Arc::ptr_eq(d, &l.frame.data) && *w == l.frame.width && *h == l.frame.height && *t == l.transform
+            && e.inputs.iter().zip(layers).all(|((d, w, h, t, f), l)| {
+                std::sync::Arc::ptr_eq(d, &l.frame.data) && *w == l.frame.width && *h == l.frame.height && *t == l.transform && f.as_slice() == l.filters
             })
     }
 
@@ -247,7 +276,7 @@ impl Memo {
         let same_layout = |e: &MemoEntry| {
             e.transparent == transparent
                 && e.inputs.len() == entry.inputs.len()
-                && e.inputs.iter().zip(&entry.inputs).all(|((_, w, h, t), (_, w2, h2, t2))| (w, h, t) == (w2, h2, t2))
+                && e.inputs.iter().zip(&entry.inputs).all(|((_, w, h, t, f), (_, w2, h2, t2, f2))| (w, h, t) == (w2, h2, t2) && f.len() == f2.len())
         };
         if let Some(e) = self.entries.iter_mut().find(|e| same_layout(e)) {
             *e = entry;
@@ -265,6 +294,9 @@ impl Memo {
 pub struct Layer<'a> {
     pub frame: &'a VideoFrame,
     pub transform: Transform,
+    /// Video filters to run on `frame` before it is drawn: on the GPU as passes over the texture, on
+    /// the CPU through the matching CPU filters. Empty for an unfiltered layer.
+    pub filters: &'a [filters::GpuFilter],
 }
 
 pub struct Compositor {
@@ -395,6 +427,13 @@ impl Compositor {
             })
             .collect();
 
+        // Shrunk layers average an n x n grid of bilinear taps over each pixel's footprint (as the GPU
+        // path does), instead of skipping texels.
+        let shrink_n: Option<usize> = {
+            let r = inv_sx.max(inv_sy);
+            (r > 1.25).then(|| (r.ceil() as usize).min(8))
+        };
+
         canvas
             .par_chunks_exact_mut(cw * 4)
             .enumerate()
@@ -421,7 +460,29 @@ impl Compositor {
                 for (k, &(a, b, fx)) in cols.iter().enumerate() {
                     let d = (x0 as usize + k) * 4;
                     let mut px = [0u32; 4];
-                    if identity {
+                    if let Some(n) = shrink_n {
+                        let x = x0 as usize + k;
+                        let step = 1.0 / n as f32;
+                        let mut acc = [0f32; 4];
+                        for j in 0..n {
+                            let ty = (y as f32 + 0.5 - t.y) * inv_sy - 0.5 + ((j as f32 + 0.5) * step - 0.5) * inv_sy;
+                            for i in 0..n {
+                                let tx = (x as f32 + 0.5 - t.x) * inv_sx - 0.5 + ((i as f32 + 0.5) * step - 0.5) * inv_sx;
+                                let s = bilerp(src, sw, (cl as usize, ct as usize), (src_w as usize, src_h as usize), tx, ty);
+                                for c in 0..3 {
+                                    acc[c] += s[c] * s[3];
+                                }
+                                acc[3] += s[3];
+                            }
+                        }
+                        let a = acc[3] * step * step;
+                        if acc[3] > 0.0 {
+                            for c in 0..3 {
+                                px[c] = (acc[c] / acc[3]).round().clamp(0.0, 255.0) as u32;
+                            }
+                        }
+                        px[3] = a.round().clamp(0.0, 255.0) as u32;
+                    } else if identity {
                         let p = pixel(s0, a);
                         for c in 0..4 {
                             px[c] = p[c] as u32;
@@ -459,6 +520,27 @@ impl Compositor {
                 }
             });
     }
+}
+
+/// Bilinear sample of the cropped source region at (`sx`, `sy`) in region pixels, clamped to its edge.
+fn bilerp(src: &[u8], stride_px: usize, origin: (usize, usize), size: (usize, usize), sx: f32, sy: f32) -> [f32; 4] {
+    let sx = sx.clamp(0.0, (size.0 - 1) as f32);
+    let sy = sy.clamp(0.0, (size.1 - 1) as f32);
+    let (ix, iy) = (sx.floor() as usize, sy.floor() as usize);
+    let (fx, fy) = (sx - ix as f32, sy - iy as f32);
+    let (jx, jy) = ((ix + 1).min(size.0 - 1), (iy + 1).min(size.1 - 1));
+    let at = |x: usize, y: usize| -> &[u8] {
+        let i = ((origin.1 + y) * stride_px + origin.0 + x) * 4;
+        &src[i..i + 4]
+    };
+    let (p00, p01, p10, p11) = (at(ix, iy), at(jx, iy), at(ix, jy), at(jx, jy));
+    let mut out = [0f32; 4];
+    for c in 0..4 {
+        let top = p00[c] as f32 * (1.0 - fx) + p01[c] as f32 * fx;
+        let bot = p10[c] as f32 * (1.0 - fx) + p11[c] as f32 * fx;
+        out[c] = top * (1.0 - fy) + bot * fy;
+    }
+    out
 }
 
 impl Compositor {
@@ -607,7 +689,7 @@ mod tests {
         r.set_pipelined(true);
         let (a, b) = (VideoFrame::solid(32, 32, [255, 0, 0, 255]), VideoFrame::solid(32, 32, [0, 0, 255, 255]));
         fn l(f: &VideoFrame) -> [Layer<'_>; 1] {
-            [Layer { frame: f, transform: Transform::default() }]
+            [Layer { frame: f, transform: Transform::default(), filters: &[] }]
         }
         for _ in 0..3 {
             assert_eq!(&r.compose(&l(&a)).data[..4], &[255, 0, 0, 255]);
@@ -630,6 +712,55 @@ mod tests {
         f.data[i..i + 4].try_into().unwrap()
     }
 
+    /// A layer shrunk 4:1 averages its source: 1-pixel lines every 4th pixel come out ~25% grey on
+    /// both compositors, and they agree with each other.
+    #[test]
+    fn shrunk_layers_average_on_cpu_and_gpu() {
+        let mut src = vec![0u8; 256 * 256 * 4];
+        for (i, px) in src.chunks_exact_mut(4).enumerate() {
+            let v = if (i % 256) % 4 == 0 { 255 } else { 0 };
+            px.copy_from_slice(&[v, v, v, 255]);
+        }
+        let f = ferrous_core::VideoFrame::new(256, 256, src);
+        let tf = ferrous_core::Transform { scale_x: 0.25, scale_y: 0.25, ..Default::default() };
+        let layers = [Layer { frame: &f, transform: tf, filters: &[] }];
+        let cpu = Compositor::new(64, 64).compose(&layers);
+        let inner = |v: &ferrous_core::VideoFrame| -> Vec<f32> {
+            v.data.chunks_exact(4).enumerate().filter(|(i, _)| (4..60).contains(&(i % 64)) && (4..60).contains(&(i / 64))).map(|(_, p)| p[0] as f32).collect()
+        };
+        let c = inner(&cpu);
+        let mean = c.iter().sum::<f32>() / c.len() as f32;
+        assert!((mean - 64.0).abs() < 8.0, "cpu mean {mean}");
+        assert!(c.iter().all(|v| (v - 64.0).abs() < 24.0), "cpu skipped lines");
+        if let Ok(mut g) = gpu::GpuCompositor::new(64, 64) {
+            let gp = inner(&g.compose_into(&layers, Vec::new(), false));
+            let worst = c.iter().zip(&gp).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            assert!(worst < 24.0, "cpu and gpu differ by {worst}");
+        }
+    }
+
+    /// On the CPU path the same filter plan is baked in first, and the memo sees filter changes.
+    #[test]
+    fn cpu_renderer_runs_filter_plans_and_memo_notices_changes() {
+        use crate::filters::GpuFilter;
+        let (mut r, _) = Renderer::new(8, 1, false);
+        let mut px = vec![0u8; 8 * 4];
+        px[0] = 200; // pixel 0 is blue
+        px[3] = 255;
+        let f = ferrous_core::VideoFrame::new(8, 1, px);
+        let at = |dx: f32| [GpuFilter::Scroll { dx, dy: 0.0 }];
+        let one = at(1.0);
+        let a = r.compose(&[Layer { frame: &f, transform: Default::default(), filters: &one }]);
+        assert_eq!((a.data[0], a.data[4]), (0, 200), "scrolled one pixel right");
+        // Same frame buffer, different offset: must not come back from the memo.
+        let three = at(3.0);
+        let b = r.compose(&[Layer { frame: &f, transform: Default::default(), filters: &three }]);
+        assert_eq!(b.data[12], 200, "scrolled three pixels right");
+        // Same plan again is the memoised result.
+        let again = r.compose(&[Layer { frame: &f, transform: Default::default(), filters: &three }]);
+        assert!(std::sync::Arc::ptr_eq(&b.data, &again.data));
+    }
+
     #[test]
     fn draws_scaled_layer_with_position() {
         let red = VideoFrame::solid(10, 10, [0, 0, 255, 255]);
@@ -637,6 +768,7 @@ mod tests {
         let out = c.compose(&[Layer {
             frame: &red,
             transform: Transform { x: 20.0, y: 10.0, scale_x: 2.0, scale_y: 2.0, ..Default::default() },
+            filters: &[],
         }]);
         assert_eq!(px(&out, 25, 15), [0, 0, 255, 255]);
         assert_eq!(px(&out, 39, 29), [0, 0, 255, 255]);
@@ -651,6 +783,7 @@ mod tests {
         let out = c.compose(&[Layer {
             frame: &white,
             transform: Transform { opacity: 0.5, crop: [0, 0, 2, 0], ..Default::default() },
+            filters: &[],
         }]);
         let p = px(&out, 0, 0);
         assert!((120..=135).contains(&p[0]), "{p:?}");
@@ -662,7 +795,7 @@ mod tests {
         let f = VideoFrame::solid(8, 8, [1, 2, 3, 255]);
         let c = Compositor::new(16, 16);
         for (x, y) in [(-100.0, 0.0), (100.0, 0.0), (-4.0, -4.0), (12.0, 12.0)] {
-            c.compose(&[Layer { frame: &f, transform: Transform { x, y, ..Default::default() } }]);
+            c.compose(&[Layer { frame: &f, transform: Transform { x, y, ..Default::default() }, filters: &[] }]);
         }
     }
 
@@ -682,9 +815,9 @@ mod tests {
         let red = VideoFrame::solid(10, 10, [0, 0, 255, 255]);
         let half = VideoFrame::solid(40, 40, [255, 255, 255, 128]);
         let layers = [
-            Layer { frame: &grad, transform: Transform { x: 10.0, y: 5.0, scale_x: 3.0, scale_y: 2.5, ..Default::default() } },
-            Layer { frame: &red, transform: Transform { x: 200.0, y: 100.0, ..Default::default() } },
-            Layer { frame: &half, transform: Transform { x: 150.0, y: 60.0, opacity: 0.8, ..Default::default() } },
+            Layer { frame: &grad, transform: Transform { x: 10.0, y: 5.0, scale_x: 3.0, scale_y: 2.5, ..Default::default() }, filters: &[] },
+            Layer { frame: &red, transform: Transform { x: 200.0, y: 100.0, ..Default::default() }, filters: &[] },
+            Layer { frame: &half, transform: Transform { x: 150.0, y: 60.0, opacity: 0.8, ..Default::default() }, filters: &[] },
         ];
         let a = Compositor::new(320, 180).compose(&layers);
         let b = gpu.compose(&layers);
@@ -711,11 +844,11 @@ mod tests {
         // 10x40 bar.
         let bar = VideoFrame::solid(40, 10, [255, 255, 255, 255]);
         let c = Compositor::new(100, 100);
-        let out = c.compose(&[Layer { frame: &bar, transform: Transform { x: 30.0, y: 45.0, rotation: 90.0, ..Default::default() } }]);
+        let out = c.compose(&[Layer { frame: &bar, transform: Transform { x: 30.0, y: 45.0, rotation: 90.0, ..Default::default() }, filters: &[] }]);
         assert_eq!(px(&out, 50, 32), [255, 255, 255, 255], "inside, vertical extent");
         assert_eq!(px(&out, 35, 50), [0, 0, 0, 255], "outside, old horizontal extent");
         // 45°: an edge pixel is partly covered.
-        let out = c.compose(&[Layer { frame: &bar, transform: Transform { x: 30.0, y: 45.0, rotation: 45.0, ..Default::default() } }]);
+        let out = c.compose(&[Layer { frame: &bar, transform: Transform { x: 30.0, y: 45.0, rotation: 45.0, ..Default::default() }, filters: &[] }]);
         let partial = (0..100).flat_map(|y| (0..100).map(move |x| (x, y))).filter(|&(x, y)| { let v = px(&out, x, y)[0]; v > 20 && v < 235 }).count();
         assert!(partial > 20, "antialiased edge pixels: {partial}");
         assert_eq!(px(&out, 50, 50), [255, 255, 255, 255]);
@@ -733,7 +866,7 @@ mod tests {
             p.copy_from_slice(&[(x * 8) as u8, (y * 10) as u8, 128, 255]);
         }
         let grad = VideoFrame::new(32, 24, data);
-        let layers = [Layer { frame: &grad, transform: Transform { x: 40.0, y: 30.0, scale_x: 2.0, scale_y: 2.0, rotation: 30.0, ..Default::default() } }];
+        let layers = [Layer { frame: &grad, transform: Transform { x: 40.0, y: 30.0, scale_x: 2.0, scale_y: 2.0, rotation: 30.0, ..Default::default() }, filters: &[] }];
         let a = Compositor::new(160, 120).compose(&layers);
         let b = gpu.compose(&layers);
         // Compare pixels well inside the box (edges differ only by AA rounding).
@@ -775,7 +908,7 @@ mod tests {
             for round in 0..4 {
                 // Alternate sides so a stale buffer would show the old half.
                 let (f, t) = if round % 2 == 0 { (&red, left) } else { (&blue, right) };
-                let layers = [Layer { frame: f, transform: t }];
+                let layers = [Layer { frame: f, transform: t, filters: &[] }];
                 let out = if transparent { r.compose_transparent(&layers) } else { r.compose(&layers) };
                 let other_x = if round % 2 == 0 { 48 } else { 16 };
                 let px = &out.data[((16 * w + other_x) * 4) as usize..][..4];

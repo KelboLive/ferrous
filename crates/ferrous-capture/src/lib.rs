@@ -11,6 +11,8 @@ pub mod browser;
 #[cfg(windows)]
 mod appaudio;
 #[cfg(windows)]
+mod gpu_ring;
+#[cfg(windows)]
 mod wgc;
 
 use std::path::PathBuf;
@@ -53,9 +55,26 @@ pub struct SourceContext {
     pub fps: u32,
 }
 
+static GPU_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns GPU-resident capture on for sources created from now on (Windows display, window and game
+/// capture; off by default). Harmless elsewhere.
+pub fn set_gpu_capture(on: bool) {
+    GPU_CAPTURE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn gpu_capture() -> bool {
+    GPU_CAPTURE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub trait Source: Send {
     /// Latest frame, or `None` if nothing has arrived yet.
     fn latest_frame(&mut self) -> Option<VideoFrame>;
+    /// Latest frame as a shared GPU texture (see [`ferrous_core::SharedFrame`]), for sources that can
+    /// hand one over. Asking for it instead of [`Source::latest_frame`] is what saves the CPU copy.
+    fn latest_gpu_frame(&mut self) -> Option<VideoFrame> {
+        None
+    }
     /// False once the source has died (e.g. captured window closed); the
     /// engine will try to recreate it.
     fn is_alive(&self) -> bool {

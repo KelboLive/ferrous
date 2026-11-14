@@ -60,6 +60,43 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// On Windows, records a hard crash (a driver or access violation, which Rust never sees as a panic)
+/// in `native-crash.txt` next to the settings: the exception code and which DLL it happened in.
+#[cfg(windows)]
+pub fn install_native_crash_log() {
+    use windows::Win32::System::Diagnostics::Debug::{SetUnhandledExceptionFilter, EXCEPTION_POINTERS};
+    use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT};
+
+    unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: Windows passes a valid pointer; everything below only reads from it.
+        unsafe {
+            let (mut code, mut addr) = (0u32, std::ptr::null_mut());
+            if !info.is_null() && !(*info).ExceptionRecord.is_null() {
+                code = (*(*info).ExceptionRecord).ExceptionCode.0 as u32;
+                addr = (*(*info).ExceptionRecord).ExceptionAddress;
+            }
+            let mut module = String::from("unknown");
+            let mut handle = Default::default();
+            if GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, windows::core::PCWSTR(addr as *const u16), &mut handle).is_ok() {
+                let mut buf = [0u16; 520];
+                let n = GetModuleFileNameW(Some(handle), &mut buf) as usize;
+                module = String::from_utf16_lossy(&buf[..n.min(buf.len())]);
+            }
+            let text = format!("Ferrous {} native crash: exception 0x{code:08X} at {addr:p} in {module}\n", env!("CARGO_PKG_VERSION"));
+            log::error!("{text}");
+            log::logger().flush();
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(ferrous_core::paths::config_dir().join("native-crash.txt")) {
+                let _ = f.write_all(text.as_bytes());
+            }
+        }
+        0 // EXCEPTION_CONTINUE_SEARCH: let Windows handle it as usual
+    }
+    // SAFETY: installs a process-wide handler that only writes a file.
+    unsafe {
+        SetUnhandledExceptionFilter(Some(filter));
+    }
+}
+
 /// `YYYYMMDD-HHMMSS` in UTC, without pulling in a date crate.
 fn chrono_like_stamp() -> String {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);

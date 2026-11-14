@@ -14,12 +14,30 @@ pub struct VideoFrame {
     /// converting on the CPU; anything that changes `data` builds a new
     /// frame, which leaves this `None`.
     pub nv12: Option<Arc<Vec<u8>>>,
+    /// Set for a frame that lives only on the GPU (Windows capture handing over a shared texture):
+    /// `data` is then empty, and only the GPU compositor can draw it. The engine asks for such
+    /// frames only when it can, and otherwise reads the source's ordinary CPU frame.
+    pub gpu: Option<Arc<SharedFrame>>,
+}
+
+/// A frame in a shared GPU texture, as Windows capture produces it: a D3D11 texture shared through an
+/// NT handle that the renderer opens on its own D3D12 device, so the picture never visits the CPU.
+pub struct SharedFrame {
+    /// Identifies the texture (one of a small ring); `seq` counts the frames written into it.
+    pub id: u64,
+    pub seq: u64,
+    /// The NT handle (as an integer, so this type is the same on every platform).
+    pub handle: usize,
+    /// The adapter the texture lives on; the renderer must be on the same one.
+    pub luid: i64,
+    /// Keeps the ring slot from being overwritten while a consumer still holds this frame.
+    pub guard: Arc<dyn std::any::Any + Send + Sync>,
 }
 
 impl VideoFrame {
     pub fn new(width: u32, height: u32, data: Vec<u8>) -> Self {
         debug_assert_eq!(data.len(), (width * height * 4) as usize);
-        Self { width, height, data: Arc::new(data), nv12: None }
+        Self { width, height, data: Arc::new(data), nv12: None, gpu: None }
     }
 
     pub fn solid(width: u32, height: u32, bgra: [u8; 4]) -> Self {
@@ -28,6 +46,11 @@ impl VideoFrame {
             px.copy_from_slice(&bgra);
         }
         Self::new(width, height, data)
+    }
+
+    /// A frame that exists only as a shared GPU texture.
+    pub fn from_gpu(width: u32, height: u32, shared: SharedFrame) -> Self {
+        Self { width, height, data: Arc::new(Vec::new()), nv12: None, gpu: Some(Arc::new(shared)) }
     }
 
     pub fn byte_len(&self) -> usize {

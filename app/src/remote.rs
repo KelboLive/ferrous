@@ -42,7 +42,7 @@ pub struct Remote {
 }
 
 pub fn start(cfg: &ferrous_core::RemoteSettings, ctx: &eframe::egui::Context) -> anyhow::Result<Remote> {
-    let (tx, rx) = crossbeam_channel::unbounded();
+    let (tx, rx) = crossbeam_channel::bounded(64); // senders are per-client threads, so a full queue only pauses that client
     let ctx = ctx.clone();
     let server = RemoteServer::start(cfg.port, Some(cfg.password.clone()), tx, Arc::new(move || ctx.request_repaint()))?;
     Ok(Remote { server, calls: rx, config: cfg.clone() })

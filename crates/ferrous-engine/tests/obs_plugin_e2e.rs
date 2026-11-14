@@ -40,7 +40,7 @@ fn obs_color_source_runs_and_updates_live() {
     let Some(host) = host() else { return };
     std::env::set_var("FERROUS_OBS_HOST", &host);
     let mut settings = Settings::default();
-    settings.video = VideoSettings { base_width: 320, base_height: 240, output_width: 320, output_height: 240, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false };
+    settings.video = VideoSettings { base_width: 320, base_height: 240, output_width: 320, output_height: 240, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false };
     settings.audio.desktop_enabled = false;
     settings.audio.mic_enabled = false;
     let mut scenes = SceneCollection::default();

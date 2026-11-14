@@ -25,7 +25,7 @@ fn main() {
     settings.video = VideoSettings {
         base_width: 1920, base_height: 1080, output_width: 1920, output_height: 1080, fps: 60,
         renderer: if gpu { RendererMode::Auto } else { RendererMode::Cpu },
-        vertical: heavy.then_some((1080, 1920)), conversion: Default::default(), pipelined_readback: true, gpu_priority: false,
+        vertical: heavy.then_some((1080, 1920)), conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false,
     };
     settings.audio.desktop_enabled = false;
     settings.audio.mic_enabled = false;

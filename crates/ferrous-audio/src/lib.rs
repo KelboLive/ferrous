@@ -554,8 +554,9 @@ fn open_monitor(host: &cpal::Host, name: Option<&str>, rx: Receiver<Chunk>) -> a
     }
     let channels = config.channels() as usize;
     let mut resampler = LinearResampler::new(SAMPLE_RATE, config.sample_rate());
-    let mut queue: VecDeque<f32> = VecDeque::new();
-    let mut tmp = Vec::new();
+    // Sized up front so the realtime callback doesn't allocate (~100 ms cap plus one block of headroom).
+    let mut queue: VecDeque<f32> = VecDeque::with_capacity((SAMPLE_RATE as usize / 10) * CHANNELS * 2);
+    let mut tmp: Vec<f32> = Vec::with_capacity(16 * 1024);
     let stream = device.build_output_stream(
         config.config(),
         move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
@@ -612,8 +613,8 @@ where
 {
     let channels = config.channels() as usize;
     let mut resampler = LinearResampler::new(config.sample_rate(), SAMPLE_RATE);
-    let mut stereo: Vec<f32> = Vec::new();
-    let mut resampled: Vec<f32> = Vec::new();
+    let mut stereo: Vec<f32> = Vec::with_capacity(16 * 1024);
+    let mut resampled: Vec<f32> = Vec::with_capacity(16 * 1024);
     let stream = device.build_input_stream(
         config.config(),
         move |data: &[T], _: &cpal::InputCallbackInfo| {

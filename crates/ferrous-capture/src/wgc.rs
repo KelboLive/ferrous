@@ -1,7 +1,7 @@
 //! Windows Graphics Capture (Windows 10 1903+), the same API OBS uses for
 //! its "Windows 10 (1903 and up)" capture method.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ferrous_core::VideoFrame;
@@ -16,6 +16,7 @@ use windows_capture::settings::{
 };
 use windows_capture::window::Window;
 
+use crate::gpu_ring::Ring;
 use crate::{MonitorInfo, Source, WindowInfo};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -23,12 +24,46 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Clone)]
 struct Shared {
     latest: Arc<Mutex<Option<VideoFrame>>>,
+    /// The newest frame as a shared GPU texture (GPU-resident mode only).
+    latest_gpu: Arc<Mutex<Option<VideoFrame>>>,
     alive: Arc<AtomicBool>,
+    /// GPU-resident mode was asked for and has not failed.
+    gpu: Arc<AtomicBool>,
+    /// When the CPU frame was last asked for, in ms since `epoch`; in GPU mode the CPU copy only runs
+    /// while someone wants it (a filter or consumer the GPU path can't serve).
+    cpu_wanted: Arc<AtomicU64>,
+    epoch: std::time::Instant,
+}
+
+impl Shared {
+    fn cpu_needed(&self) -> bool {
+        if !self.gpu.load(Ordering::Relaxed) {
+            return true;
+        }
+        let last = self.cpu_wanted.load(Ordering::Relaxed);
+        last != 0 && (self.epoch.elapsed().as_millis() as u64).saturating_sub(last) < 2000
+    }
 }
 
 struct Handler {
     shared: Shared,
     pool: ferrous_core::FramePool,
+    ring: Option<Ring>,
+}
+
+impl Handler {
+    /// Copies the captured texture into the shared ring (GPU to GPU) and publishes it.
+    fn publish_gpu(&mut self, frame: &Frame) -> Result<(), BoxError> {
+        let (w, h) = (frame.width(), frame.height());
+        if self.ring.as_ref().is_none_or(|r| r.size() != (w, h)) {
+            self.ring = Some(Ring::new(frame.device(), w, h)?);
+        }
+        let ring = self.ring.as_mut().expect("ring just made");
+        if let Some(f) = ring.publish(frame.device_context(), frame.as_raw_texture())? {
+            *self.shared.latest_gpu.lock() = Some(f);
+        }
+        Ok(())
+    }
 }
 
 impl GraphicsCaptureApiHandler for Handler {
@@ -36,7 +71,7 @@ impl GraphicsCaptureApiHandler for Handler {
     type Error = BoxError;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        Ok(Self { shared: ctx.flags, pool: ferrous_core::FramePool::default() })
+        Ok(Self { shared: ctx.flags, pool: ferrous_core::FramePool::default(), ring: None })
     }
 
     fn on_frame_arrived(
@@ -44,6 +79,18 @@ impl GraphicsCaptureApiHandler for Handler {
         frame: &mut Frame,
         _control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
+        if self.shared.gpu.load(Ordering::Relaxed) {
+            if let Err(e) = self.publish_gpu(frame) {
+                // Whatever went wrong, the ordinary CPU path still works: use it from now on.
+                log::warn!("GPU capture failed, using the CPU path: {e}");
+                self.shared.gpu.store(false, Ordering::Relaxed);
+                *self.shared.latest_gpu.lock() = None;
+                self.ring = None;
+            }
+        }
+        if !self.shared.cpu_needed() {
+            return Ok(());
+        }
         let mut buffer = frame.buffer()?;
         let (w, h) = (buffer.width(), buffer.height());
         let (row, pitch) = (w as usize * 4, buffer.row_pitch() as usize);
@@ -100,7 +147,14 @@ impl WgcSource {
     where
         T: TryInto<windows_capture::settings::GraphicsCaptureItemType> + Send + 'static,
     {
-        let shared = Shared { latest: Arc::new(Mutex::new(None)), alive: Arc::new(AtomicBool::new(true)) };
+        let shared = Shared {
+            latest: Arc::new(Mutex::new(None)),
+            latest_gpu: Arc::new(Mutex::new(None)),
+            alive: Arc::new(AtomicBool::new(true)),
+            gpu: Arc::new(AtomicBool::new(crate::gpu_capture())),
+            cpu_wanted: Arc::new(AtomicU64::new(0)),
+            epoch: std::time::Instant::now(),
+        };
         let settings = Settings::new(
             item,
             cursor(capture_cursor),
@@ -144,7 +198,18 @@ impl WgcSource {
 
 impl Source for WgcSource {
     fn latest_frame(&mut self) -> Option<VideoFrame> {
+        if self.shared.gpu.load(Ordering::Relaxed) {
+            // A consumer that can't use the GPU frame: start (and keep) making CPU frames.
+            self.shared.cpu_wanted.store((self.shared.epoch.elapsed().as_millis() as u64).max(1), Ordering::Relaxed);
+        }
         self.shared.latest.lock().clone()
+    }
+
+    fn latest_gpu_frame(&mut self) -> Option<VideoFrame> {
+        if !self.shared.gpu.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.shared.latest_gpu.lock().clone()
     }
 
     fn is_alive(&self) -> bool {
@@ -236,6 +301,11 @@ impl Source for GameSource {
     fn latest_frame(&mut self) -> Option<VideoFrame> {
         self.follow();
         self.inner.as_mut().and_then(|(s, ..)| s.latest_frame())
+    }
+
+    fn latest_gpu_frame(&mut self) -> Option<VideoFrame> {
+        self.follow();
+        self.inner.as_mut().and_then(|(s, ..)| s.latest_gpu_frame())
     }
 
     fn is_alive(&self) -> bool {

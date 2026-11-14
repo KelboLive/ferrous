@@ -45,6 +45,16 @@ impl Lut3d {
     }
 
     /// Trilinear lookup. `.cube` order: red changes fastest.
+    /// Edge length of the cube.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Entries with red varying fastest, then green, then blue.
+    pub fn entries(&self) -> &[[f32; 3]] {
+        &self.data
+    }
+
     fn sample(&self, r: f32, g: f32, b: f32) -> [f32; 3] {
         let n = self.size - 1;
         let f = |v: f32| {
@@ -196,13 +206,61 @@ pub fn apply_lut(frame: &VideoFrame, lut: &Lut3d, amount: f32) -> VideoFrame {
     })
 }
 
+/// One filter step in a form the GPU compositor can run on a layer's texture. The same data drives
+/// the CPU fallback ([`GpuFilter::apply_cpu`]), so both produce the same picture.
+#[derive(Clone)]
+pub enum GpuFilter {
+    ChromaKey { key_rgb: [u8; 3], similarity: u32, smoothness: u32, spill: u32 },
+    ColorCorrection { gamma: f32, contrast: f32, brightness: f32, saturation: f32, hue_shift: f32, opacity: f32 },
+    /// Offset in pixels (wraps).
+    Scroll { dx: f32, dy: f32 },
+    Lut { lut: std::sync::Arc<Lut3d>, amount: f32 },
+    Matte { mask: std::sync::Arc<crate::matte::Mask>, threshold: f32, softness: f32 },
+}
+
+impl PartialEq for GpuFilter {
+    fn eq(&self, other: &Self) -> bool {
+        use GpuFilter::*;
+        match (self, other) {
+            (ChromaKey { key_rgb: a, similarity: b, smoothness: c, spill: d }, ChromaKey { key_rgb: a2, similarity: b2, smoothness: c2, spill: d2 }) => (a, b, c, d) == (a2, b2, c2, d2),
+            (ColorCorrection { gamma: a, contrast: b, brightness: c, saturation: d, hue_shift: e, opacity: f }, ColorCorrection { gamma: a2, contrast: b2, brightness: c2, saturation: d2, hue_shift: e2, opacity: f2 }) => {
+                (a, b, c, d, e, f) == (a2, b2, c2, d2, e2, f2)
+            }
+            (Scroll { dx, dy }, Scroll { dx: dx2, dy: dy2 }) => (dx, dy) == (dx2, dy2),
+            (Lut { lut, amount }, Lut { lut: l2, amount: a2 }) => std::sync::Arc::ptr_eq(lut, l2) && amount == a2,
+            (Matte { mask, threshold, softness }, Matte { mask: m2, threshold: t2, softness: s2 }) => mask.version == m2.version && (threshold, softness) == (t2, s2),
+            _ => false,
+        }
+    }
+}
+
+impl GpuFilter {
+    /// The CPU version of this step (used when there is no GPU compositor).
+    pub fn apply_cpu(&self, frame: &VideoFrame) -> VideoFrame {
+        match self {
+            GpuFilter::ChromaKey { key_rgb, similarity, smoothness, spill } => chroma_key(frame, *key_rgb, *similarity, *smoothness, *spill),
+            GpuFilter::ColorCorrection { gamma, contrast, brightness, saturation, hue_shift, opacity } => {
+                color_correction(frame, *gamma, *contrast, *brightness, *saturation, *hue_shift, *opacity)
+            }
+            GpuFilter::Scroll { dx, dy } => scroll(frame, *dx, *dy),
+            GpuFilter::Lut { lut, amount } => apply_lut(frame, lut, *amount),
+            GpuFilter::Matte { mask, threshold, softness } => crate::matte::apply_mask(frame, mask, *threshold, *softness),
+        }
+    }
+}
+
+/// Runs a plan on the CPU, step by step.
+pub fn apply_plan_cpu(frame: &VideoFrame, plan: &[GpuFilter]) -> VideoFrame {
+    plan.iter().fold(frame.clone(), |f, op| op.apply_cpu(&f))
+}
+
 /// Input buffer, settings, output and error of the last filter run.
 type FilterMemo = (std::sync::Arc<Vec<u8>>, VideoFilters, VideoFrame, Option<String>);
 
 /// A source's video filters plus the state they need (scroll clock, LUTs).
 pub struct VideoFilterChain {
     start: Instant,
-    lut: Option<(PathBuf, Result<Lut3d, String>)>,
+    lut: Option<(PathBuf, Result<std::sync::Arc<Lut3d>, String>)>,
     /// Plugin instances by (plugin id, settings), recreated when settings change.
     plugins: Vec<((String, String), Result<ferrous_plugins::Instance, String>)>,
     /// Last input buffer, filter settings and result, for chains that are a
@@ -241,6 +299,62 @@ impl VideoFilterChain {
         let (out, err) = self.run(frame, filters);
         self.memo = pure.then(|| (input, filters.clone(), out.clone(), err.clone()));
         (out, err)
+    }
+
+    /// The enabled filters as GPU steps, in order, plus the first error. `None` when the chain has a
+    /// step only the CPU can run (a plugin): use [`VideoFilterChain::apply`] for that one.
+    pub fn plan(&mut self, frame: &VideoFrame, filters: &VideoFilters) -> Option<(Vec<GpuFilter>, Option<String>)> {
+        if filters.iter().any(|f| f.enabled && matches!(f.filter, VideoFilter::Plugin { .. })) {
+            return None;
+        }
+        let mut err = None;
+        let mut plan = Vec::new();
+        if !filters.iter().any(|fl| fl.enabled && matches!(fl.filter, VideoFilter::BackgroundRemoval { .. })) {
+            self.matte = None;
+        }
+        for filter in filters.iter().filter(|f| f.enabled) {
+            match &filter.filter {
+                VideoFilter::BackgroundRemoval { threshold, softness, smoothing, max_fps } => {
+                    let worker = self.matte.get_or_insert_with(crate::matte::MatteWorker::start);
+                    worker.submit(frame, *max_fps, *smoothing);
+                    if let Some(e) = worker.error() {
+                        err.get_or_insert(e);
+                    }
+                    // No mask yet (model still loading): show the picture as it is.
+                    if let Some(mask) = worker.mask() {
+                        plan.push(GpuFilter::Matte { mask, threshold: *threshold, softness: *softness });
+                    }
+                }
+                VideoFilter::ChromaKey { key_rgb, similarity, smoothness, spill } => {
+                    plan.push(GpuFilter::ChromaKey { key_rgb: *key_rgb, similarity: *similarity, smoothness: *smoothness, spill: *spill })
+                }
+                VideoFilter::ColorCorrection { gamma, contrast, brightness, saturation, hue_shift, opacity } => plan.push(GpuFilter::ColorCorrection {
+                    gamma: *gamma,
+                    contrast: *contrast,
+                    brightness: *brightness,
+                    saturation: *saturation,
+                    hue_shift: *hue_shift,
+                    opacity: *opacity,
+                }),
+                VideoFilter::Scroll { speed_x, speed_y } => {
+                    let t = self.start.elapsed().as_secs_f32();
+                    plan.push(GpuFilter::Scroll { dx: speed_x * t, dy: speed_y * t });
+                }
+                VideoFilter::Lut { path, amount } => {
+                    if self.lut.as_ref().map(|(p, _)| p != path).unwrap_or(true) {
+                        self.lut = Some((path.clone(), Lut3d::load(path).map(std::sync::Arc::new).map_err(|e| e.to_string())));
+                    }
+                    match &self.lut.as_ref().unwrap().1 {
+                        Ok(lut) => plan.push(GpuFilter::Lut { lut: lut.clone(), amount: *amount }),
+                        Err(e) => {
+                            err.get_or_insert_with(|| format!("LUT: {e}"));
+                        }
+                    }
+                }
+                VideoFilter::Plugin { .. } => unreachable!("plugin chains return early"),
+            }
+        }
+        Some((plan, err))
     }
 
     fn run(&mut self, frame: VideoFrame, filters: &VideoFilters) -> (VideoFrame, Option<String>) {
@@ -302,7 +416,7 @@ impl VideoFilterChain {
                 }
                 VideoFilter::Lut { path, amount } => {
                     if self.lut.as_ref().map(|(p, _)| p != path).unwrap_or(true) {
-                        self.lut = Some((path.clone(), Lut3d::load(path).map_err(|e| e.to_string())));
+                        self.lut = Some((path.clone(), Lut3d::load(path).map(std::sync::Arc::new).map_err(|e| e.to_string())));
                     }
                     match &self.lut.as_ref().unwrap().1 {
                         Ok(lut) => apply_lut(&f, lut, *amount),

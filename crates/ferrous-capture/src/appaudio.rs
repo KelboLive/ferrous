@@ -58,10 +58,14 @@ fn capture(pid: u32, sink: AudioSink, stop: &AtomicBool) -> Result<(), Box<dyn s
         if capture.get_next_packet_size()?.unwrap_or(0) > 0 {
             capture.read_from_device_to_deque(&mut bytes)?;
             samples.clear();
-            while bytes.len() >= 4 {
-                let b = [bytes.pop_front().unwrap(), bytes.pop_front().unwrap(), bytes.pop_front().unwrap(), bytes.pop_front().unwrap()];
-                samples.push(f32::from_le_bytes(b));
+            // Whole samples only; a partial one stays queued for the next packet.
+            let whole = bytes.len() / 4 * 4;
+            let (a, b) = bytes.as_slices();
+            let mut it = a.iter().chain(b.iter()).copied().take(whole);
+            while let (Some(b0), Some(b1), Some(b2), Some(b3)) = (it.next(), it.next(), it.next(), it.next()) {
+                samples.push(f32::from_le_bytes([b0, b1, b2, b3]));
             }
+            bytes.drain(..whole);
             sink(&samples);
         }
         // Silent apps deliver no events; just keep waiting.

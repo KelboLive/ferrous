@@ -225,7 +225,7 @@ mod parking_lot_free {
 /// The wipe's luma map at `w x h`, generated (or loaded and scaled) once and cached.
 pub fn luma_map(wipe: &str, image: Option<&std::path::Path>, w: u32, h: u32) -> std::sync::Arc<Vec<u8>> {
     let key: MapKey = (wipe.to_string(), image.map(|p| p.to_path_buf()), w, h);
-    if let Some(m) = MAPS.0.lock().unwrap().get(&key) {
+    if let Some(m) = MAPS.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key) {
         return m.clone();
     }
     let map = image
@@ -238,7 +238,7 @@ pub fn luma_map(wipe: &str, image: Option<&std::path::Path>, w: u32, h: u32) -> 
         })
         .unwrap_or_else(|| generate(wipe, w, h));
     let map = std::sync::Arc::new(map);
-    let mut cache = MAPS.0.lock().unwrap();
+    let mut cache = MAPS.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if cache.len() > 16 {
         cache.clear();
     }

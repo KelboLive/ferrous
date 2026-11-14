@@ -94,9 +94,9 @@ pub fn bench_compositor(w: u32, h: u32, gpu: bool, frames: u32) -> (String, f32)
         live[(i as usize * 4) % n] = i as u8;
         let live = VideoFrame::new(w, h, live);
         let layers = [
-            Layer { frame: &live, transform: Transform::default() },
-            Layer { frame: &cam, transform: Transform { x: w as f32 * 0.6, y: h as f32 * 0.6, scale_x: 1.1, scale_y: 1.1, ..Default::default() } },
-            Layer { frame: &overlay, transform: Transform { y: h as f32 * 0.8, opacity: 0.8, ..Default::default() } },
+            Layer { frame: &live, transform: Transform::default(), filters: &[] },
+            Layer { frame: &cam, transform: Transform { x: w as f32 * 0.6, y: h as f32 * 0.6, scale_x: 1.1, scale_y: 1.1, ..Default::default() }, filters: &[] },
+            Layer { frame: &overlay, transform: Transform { y: h as f32 * 0.8, opacity: 0.8, ..Default::default() }, filters: &[] },
         ];
         let t = Instant::now();
         let _ = r.compose(&layers);

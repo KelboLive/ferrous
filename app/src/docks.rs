@@ -455,7 +455,9 @@ pub fn perf_dock(
         });
     });
     ui.horizontal(|ui| {
-        ui.label(RichText::new(format!("Ferrous total: {:.0}% of one core", smooth.get("perf_own", sys.own.cpu))).strong());
+        let own = smooth.get("perf_own", sys.own.cpu);
+        ui.label(RichText::new(format!("Ferrous total: {:.1}% of all cores ({own:.0}% of one core)", own / sys.cores as f32)).strong())
+            .on_hover_text("Task Manager and RTSS show the first figure. A program using several cores can pass 100% of one core: 200% means two cores' worth of work.");
         sparkline(ui, &st.total_cpu, 100.0, theme::accent(), Vec2::new(160.0, 26.0));
         match sys.gpu {
             Some(g) => {
@@ -499,7 +501,7 @@ pub fn perf_dock(
                     let c: f32 = helpers.iter().map(|p| p.cpu).sum();
                     let g: Option<f32> = helpers.iter().map(|p| p.gpu).sum();
                     let m: u64 = helpers.iter().map(|p| p.mem_bytes).sum();
-                    ui.label(format!("{:.0}% CPU{} · {}", smooth.get(&format!("h{}", r.id), c), g.map(|g| format!(" · {g:.0}% GPU")).unwrap_or_default(), fmt_bytes(m)));
+                    ui.label(format!("{:.0}% of a core{} · {}", smooth.get(&format!("h{}", r.id), c), g.map(|g| format!(" · {g:.0}% GPU")).unwrap_or_default(), fmt_bytes(m)));
                 }
                 if let Some(h) = st.cpu.get(&r.id) {
                     sparkline(ui, h, 10.0, theme::accent(), Vec2::new(120.0, 24.0));
@@ -533,7 +535,7 @@ pub fn perf_dock(
                 ui.label("-");
                 ui.label("-");
                 let p = sys.per_pid.get(pid).copied().unwrap_or_default();
-                ui.label(format!("{:.0}% CPU{} · {}", smooth.get(label, p.cpu), p.gpu.map(|g| format!(" · {g:.0}% GPU")).unwrap_or_default(), fmt_bytes(p.mem_bytes)));
+                ui.label(format!("{:.0}% of a core{} · {}", smooth.get(label, p.cpu), p.gpu.map(|g| format!(" · {g:.0}% GPU")).unwrap_or_default(), fmt_bytes(p.mem_bytes)));
                 if let Some(h) = st.proc_cpu.get(label) {
                     sparkline(ui, h, 100.0, theme::accent(), Vec2::new(120.0, 24.0));
                 } else {

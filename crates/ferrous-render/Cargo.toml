@@ -17,3 +17,6 @@ bytemuck.workspace = true
 log.workspace = true
 anyhow.workspace = true
 image.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
