@@ -15,7 +15,7 @@ use crate::{AudioSink, Source};
 fn pid_for(process: &str) -> Option<u32> {
     let want = process.to_ascii_lowercase();
     Window::enumerate().ok()?.into_iter().find_map(|w| {
-        let name = w.process_name().ok()?.to_ascii_lowercase();
+        let name = crate::wgc::process_name_of(&w)?.to_ascii_lowercase();
         (name == want).then(|| w.process_id().ok()).flatten()
     })
 }

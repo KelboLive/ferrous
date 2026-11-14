@@ -37,7 +37,7 @@ fn pump(s: &LinkSender, r: &LinkReceiver, f: &VideoFrame, secs: u64) -> Option<V
 
 #[test]
 fn jpeg_link_with_pin_audio_and_stats() {
-    let s = LinkSender::start(cfg("Gaming PC", LinkCodec::Jpeg { quality: 90, adaptive: true }, "4321")).unwrap();
+    let s = LinkSender::start(cfg("Gaming PC", LinkCodec::Jpeg { quality: 90, adaptive: true, full_chroma: false }, "4321")).unwrap();
     let heard: Arc<Mutex<Vec<f32>>> = Arc::default();
     let h2 = heard.clone();
     let r = LinkReceiver::start(&format!("127.0.0.1:{}", s.port), "4321", PathBuf::from("ffmpeg"), Some(Arc::new(move |a: &[f32]| h2.lock().extend_from_slice(a))));
@@ -64,7 +64,7 @@ fn jpeg_link_with_pin_audio_and_stats() {
 
 #[test]
 fn wrong_or_missing_pin_is_refused() {
-    let s = LinkSender::start(cfg("Locked", LinkCodec::Jpeg { quality: 80, adaptive: false }, "1111")).unwrap();
+    let s = LinkSender::start(cfg("Locked", LinkCodec::Jpeg { quality: 80, adaptive: false, full_chroma: false }, "1111")).unwrap();
     let addr = format!("127.0.0.1:{}", s.port);
     let wrong = LinkReceiver::start(&addr, "2222", PathBuf::from("ffmpeg"), None);
     let none = LinkReceiver::start(&addr, "", PathBuf::from("ffmpeg"), None);
@@ -103,7 +103,7 @@ fn hardware_codec_stream_decodes() {
 
 #[test]
 fn discovered_by_name() {
-    let s = LinkSender::start(cfg("Discoverable PC", LinkCodec::Jpeg { quality: 80, adaptive: false }, "")).unwrap();
+    let s = LinkSender::start(cfg("Discoverable PC", LinkCodec::Jpeg { quality: 80, adaptive: false, full_chroma: false }, "")).unwrap();
     ferrous_link::discovery::start_listening();
     let mut found = false;
     for _ in 0..40 {
@@ -123,7 +123,7 @@ fn discovered_by_name() {
 #[test]
 fn adaptive_quality_backs_off_for_slow_receiver() {
     use std::io::Write;
-    let mut c = cfg("Busy", LinkCodec::Jpeg { quality: 95, adaptive: true }, "");
+    let mut c = cfg("Busy", LinkCodec::Jpeg { quality: 95, adaptive: true, full_chroma: false }, "");
     c.width = 1280;
     c.height = 720;
     let s = LinkSender::start(c).unwrap();
@@ -162,7 +162,7 @@ fn adaptive_quality_backs_off_for_slow_receiver() {
 /// both codecs, and lossless must stay exact across the repeats.
 #[test]
 fn static_scene_repeats_and_late_joiners_get_the_picture() {
-    for codec in [LinkCodec::Jpeg { quality: 90, adaptive: false }, LinkCodec::Lossless] {
+    for codec in [LinkCodec::Jpeg { quality: 90, adaptive: false, full_chroma: false }, LinkCodec::Lossless] {
         let s = LinkSender::start(cfg("Static", codec.clone(), "")).unwrap();
         let f = frame(42);
         let first = LinkReceiver::start(&format!("127.0.0.1:{}", s.port), "", PathBuf::from("ffmpeg"), None);
@@ -205,7 +205,7 @@ fn receiver_follows_encoder_switches() {
     assert!(pump(&first, &r, &frame(60), 15).is_some(), "no picture from the first encoder");
     drop(first);
 
-    for (n, codec) in [LinkCodec::Jpeg { quality: 90, adaptive: false }, hw(3000), LinkCodec::Lossless, hw(2500)].into_iter().enumerate() {
+    for (n, codec) in [LinkCodec::Jpeg { quality: 90, adaptive: false, full_chroma: false }, hw(3000), LinkCodec::Lossless, hw(2500)].into_iter().enumerate() {
         let mut c = cfg("Switcher", codec, "");
         c.port = port;
         let s = LinkSender::start(c).unwrap();
@@ -290,7 +290,7 @@ fn read_hello_salt(port: u16) -> String {
 /// (which restart at 0 on each connection) repeated under the same key.
 #[test]
 fn each_connection_gets_a_fresh_salt() {
-    let s = LinkSender::start(cfg("Salty", LinkCodec::Jpeg { quality: 80, adaptive: false }, "2468")).unwrap();
+    let s = LinkSender::start(cfg("Salty", LinkCodec::Jpeg { quality: 80, adaptive: false, full_chroma: false }, "2468")).unwrap();
     let (a, b) = (read_hello_salt(s.port), read_hello_salt(s.port));
     assert!(!a.is_empty() && !b.is_empty());
     assert_ne!(a, b, "two connections shared a key");
@@ -299,7 +299,7 @@ fn each_connection_gets_a_fresh_salt() {
 /// A peer that connects and never speaks must not stop others joining.
 #[test]
 fn a_silent_connection_does_not_block_real_receivers() {
-    let s = LinkSender::start(cfg("Busy", LinkCodec::Jpeg { quality: 80, adaptive: false }, "")).unwrap();
+    let s = LinkSender::start(cfg("Busy", LinkCodec::Jpeg { quality: 80, adaptive: false, full_chroma: false }, "")).unwrap();
     let _silent: Vec<_> = (0..3).map(|_| std::net::TcpStream::connect(("127.0.0.1", s.port)).unwrap()).collect();
     let r = LinkReceiver::start(&format!("127.0.0.1:{}", s.port), "", PathBuf::from("ffmpeg"), None);
     assert!(pump(&s, &r, &frame(9), 4).is_some(), "a real receiver waited behind silent peers");

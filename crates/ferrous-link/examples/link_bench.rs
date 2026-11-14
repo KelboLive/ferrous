@@ -57,8 +57,8 @@ fn main() {
     let fps: u32 = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(60);
     let pin = args.get(5).cloned().unwrap_or_default();
     let codec = match codec_arg {
-        "jpeg85" => LinkCodec::Jpeg { quality: 85, adaptive: false },
-        "jpeg95" => LinkCodec::Jpeg { quality: 95, adaptive: false },
+        "jpeg85" => LinkCodec::Jpeg { quality: 85, adaptive: false, full_chroma: false },
+        "jpeg95" => LinkCodec::Jpeg { quality: 95, adaptive: false, full_chroma: false },
         "lossless" => LinkCodec::Lossless,
         c if c.starts_with("x264:") => LinkCodec::Hardware { encoder: "libx264".into(), bitrate_kbps: c[5..].parse().unwrap() },
         c => panic!("unknown codec {c}"),

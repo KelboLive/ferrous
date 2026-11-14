@@ -227,7 +227,7 @@ struct StreamDecoder {
 }
 
 impl StreamDecoder {
-    fn start(ffmpeg: &std::path::Path, w: u32, h: u32, timeline: Arc<Mutex<Timeline>>, stats: Arc<ReceiverStats>) -> anyhow::Result<Self> {
+    fn start(ffmpeg: &std::path::Path, w: u32, h: u32, fps: u32, timeline: Arc<Mutex<Timeline>>, stats: Arc<ReceiverStats>) -> anyhow::Result<Self> {
         let (w, h) = ((w & !1).max(2), (h & !1).max(2));
         anyhow::ensure!(codec::frame_bytes(w, h).is_some(), "unusable picture size {w}x{h}");
         let mut child = ferrous_encode::ffmpeg::command(ffmpeg)
@@ -248,6 +248,11 @@ impl StreamDecoder {
         thread::Builder::new().name("link-stream-dec".into()).spawn(move || {
             let mut nv12 = vec![0u8; w as usize * h as usize * 3 / 2];
             let mut pool = ferrous_core::FramePool::default();
+            // The decoder hands frames out unevenly (network bursts, decode bunching). Showing each one the
+            // moment it arrives made the picture judder, so play them out one frame period apart, a frame
+            // behind, and catch up (drop the backlog) if we ever fall more than a few frames behind.
+            let period = 1_000_000 / u64::from(fps.max(1));
+            let mut last_due: Option<u64> = None;
             loop {
                 if stdout.read_exact(&mut nv12).is_err() {
                     break;
@@ -256,7 +261,15 @@ impl StreamDecoder {
                 codec::nv12_to_bgra(&nv12, w as usize, h as usize, &mut bgra);
                 let f = VideoFrame::new(w, h, bgra);
                 pool.track(&f);
-                timeline.lock().push(0, Some(f));
+                let mut t = timeline.lock();
+                let ready = t.now_us();
+                let due = match last_due {
+                    Some(prev) if prev + period >= ready && prev + period <= ready + 4 * period => prev + period,
+                    _ => ready + period,
+                };
+                last_due = Some(due);
+                t.push(due, Some(f));
+                drop(t);
                 stats.frames.fetch_add(1, Ordering::Relaxed);
             }
         })?;
@@ -540,7 +553,7 @@ fn session(
                     continue;
                 }
                 if stream_dec.is_none() {
-                    stream_dec = Some(StreamDecoder::start(ffmpeg, hello.width, hello.height, timeline.clone(), stats.clone())?);
+                    stream_dec = Some(StreamDecoder::start(ffmpeg, hello.width, hello.height, hello.fps, timeline.clone(), stats.clone())?);
                 }
                 if let Some(d) = &mut stream_dec {
                     if d.stdin.write_all(&p[8..]).is_err() {

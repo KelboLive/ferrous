@@ -490,6 +490,9 @@ impl GpuCompositor {
                     view_formats: &[],
                 });
                 let view = texture.create_view(&Default::default());
+                if self.shared.is_empty() {
+                    log::info!("GPU capture active: drawing captured frames straight from the GPU ({}x{})", frame.width, frame.height);
+                }
                 self.shared.insert(shared.id, SharedTex { _texture: texture, view, last_used: self.frames });
             }
             if let Some(t) = self.shared.get_mut(&shared.id) {

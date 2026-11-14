@@ -1200,6 +1200,9 @@ fn render_loop(shared: Arc<Shared>, audio: Arc<AudioEngine>, video: ferrous_core
         laps.lap(0);
         // Vertical canvas: same program scene, its own layout.
         let vcanvas = vertical.as_mut().map(|(size, vr)| {
+            // Like the program picture: read the vertical canvas back a frame late instead of waiting for the
+            // GPU on every changed frame (a transition needs both pictures current, so it waits).
+            vr.set_pipelined(pipelined_readback && transition.is_none());
             let to = compose_vertical(&scenes.scenes[program], &scenes, &mut cache, vr, *size, (video.base_width, video.base_height));
             match &transition {
                 Some(t) if !matches!(t.cfg.kind, ferrous_core::TransitionKind::Stinger { .. } | ferrous_core::TransitionKind::Matte { .. }) => {
@@ -1413,7 +1416,20 @@ impl Drop for ActiveLink {
 /// Starts/stops Ferrous Link outputs to match the settings.
 fn sync_links(shared: &Shared, audio: &AudioEngine, settings: &Settings) {
     let mut links = shared.links.lock();
-    links.clear();
+    // Shut the old senders down completely before starting new ones, so a restarted link gets its own
+    // port back. Each link's audio thread holds a reference to its sender and lets go within ~100 ms of
+    // being told to stop; starting the new sender before that found the port still taken and moved to
+    // the next one, so receivers had to be pointed at a new port after every settings change.
+    let old: Vec<ActiveLink> = links.drain(..).collect();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    for l in old {
+        let sender = l.sender.clone();
+        drop(l); // signals its audio thread to stop
+        while Arc::strong_count(&sender) > 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(sender); // the last reference: closes the listener and records the port as just released
+    }
     let v = &settings.video;
     for cfg in settings.links.iter().filter(|l| l.enabled) {
         let fps = if cfg.fps == 0 { v.fps } else { cfg.fps.min(v.fps) };

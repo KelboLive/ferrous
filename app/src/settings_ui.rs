@@ -616,7 +616,7 @@ impl SettingsWindow {
                         ui.horizontal(|ui| {
                             let is = |c: &LinkCodec, k: u8| matches!((c, k), (LinkCodec::Jpeg { .. }, 0) | (LinkCodec::Lossless, 1) | (LinkCodec::Hardware { .. }, 2));
                             if ui.selectable_label(is(&l.codec, 0), "JPEG (lowest latency)").clicked() && !is(&l.codec, 0) {
-                                l.codec = LinkCodec::Jpeg { quality: 92, adaptive: true };
+                                l.codec = LinkCodec::Jpeg { quality: 92, adaptive: true, full_chroma: false };
                             }
                             if ui.selectable_label(is(&l.codec, 1), "Lossless + alpha").clicked() {
                                 l.codec = LinkCodec::Lossless;
@@ -627,11 +627,14 @@ impl SettingsWindow {
                         });
                         ui.end_row();
                         match &mut l.codec {
-                            LinkCodec::Jpeg { quality, adaptive } => {
+                            LinkCodec::Jpeg { quality, adaptive, full_chroma } => {
                                 crate::widgets::row_label(ui, "Quality");
                                 ui.horizontal(|ui| {
                                     ui.add(egui::Slider::new(quality, 30..=100));
                                     ui.checkbox(adaptive, "Adapt to network");
+                                    ui.checkbox(full_chroma, "Full colour detail").on_hover_text(
+                                        "Keeps colour at full resolution (4:4:4): sharper coloured text, HUD and thin lines, but about twice the CPU work and more bandwidth. Off sends colour at quarter resolution, like obs-teleport.",
+                                    );
                                 });
                                 ui.end_row();
                                 ui.label("");

@@ -73,10 +73,10 @@ pub fn scale(frame: &VideoFrame, w: u32, h: u32) -> VideoFrame {
 }
 
 /// JPEG frames, the way obs-teleport sends them: each frame is one complete
-/// JPEG (libjpeg-turbo, SIMD), straight from BGRA with full-resolution (4:4:4)
-/// chroma: 4:2:0 smears coloured text and thin UI lines, which is what a
-/// captured desktop or game HUD is made of. Throughput comes from encoding several frames at
-/// once on separate workers, not from splitting a frame.
+/// JPEG (libjpeg-turbo, SIMD) straight from BGRA with 4:2:0 chroma, as obs-teleport sends from OBS's
+/// I420 output: about half the encode work and a third less data than full-resolution (4:4:4) chroma,
+/// which is what lets 1440p60 keep up on a PC that is also running a game. Throughput comes from
+/// encoding several frames at once on separate workers, not from splitting a frame.
 pub struct JpegEncoder {
     c: turbojpeg::Compressor,
     quality: u8,
@@ -84,8 +84,13 @@ pub struct JpegEncoder {
 
 impl JpegEncoder {
     pub fn new() -> anyhow::Result<Self> {
+        Self::with_chroma(false)
+    }
+
+    /// `full_chroma`: 4:4:4 instead of 4:2:0.
+    pub fn with_chroma(full_chroma: bool) -> anyhow::Result<Self> {
         let mut c = turbojpeg::Compressor::new()?;
-        c.set_subsamp(turbojpeg::Subsamp::None)?;
+        c.set_subsamp(if full_chroma { turbojpeg::Subsamp::None } else { turbojpeg::Subsamp::Sub2x2 })?;
         c.set_quality(90)?;
         Ok(Self { c, quality: 90 })
     }

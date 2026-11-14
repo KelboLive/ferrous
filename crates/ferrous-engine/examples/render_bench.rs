@@ -32,7 +32,7 @@ fn main() {
     if heavy {
         settings.links = vec![LinkOutputSettings {
             enabled: true, name: "bench".into(), target: LinkSourceTarget::Program,
-            codec: LinkCodec::Jpeg { quality: 85, adaptive: false }, width: 1280, height: 720, fps: 0, port: 0,
+            codec: LinkCodec::Jpeg { quality: 85, adaptive: false, full_chroma: false }, width: 1280, height: 720, fps: 0, port: 0,
             pin: String::new(), audio: false, ..Default::default()
         }];
     }

@@ -21,6 +21,30 @@ use crate::{MonitorInfo, Source, WindowInfo};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// The name of the program that owns a window, e.g. `cod.exe`. `Window::process_name` asks Windows for
+/// rights that anti-cheat protected and elevated games refuse, so those games never showed up; the
+/// limited-information request below is allowed for them.
+pub(crate) fn process_name_of(w: &Window) -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+    if let Ok(n) = w.process_name() {
+        return Some(n);
+    }
+    let pid = w.process_id().ok()?;
+    // SAFETY: plain Win32 calls; the handle is closed before returning and the buffer outlives the call.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 520];
+        let mut len = buf.len() as u32;
+        let r = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut len);
+        let _ = CloseHandle(h);
+        r.ok()?;
+        let path = String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())]);
+        path.rsplit(['\\', '/']).next().filter(|n| !n.is_empty()).map(str::to_string)
+    }
+}
+
 #[derive(Clone)]
 struct Shared {
     latest: Arc<Mutex<Option<VideoFrame>>>,
@@ -229,12 +253,33 @@ impl Drop for WgcSource {
 }
 
 /// Programs that are never "the game" when detecting automatically.
-const NOT_GAMES: [&str; 8] = ["explorer.exe", "searchhost.exe", "startmenuexperiencehost.exe", "shellexperiencehost.exe", "applicationframehost.exe", "textinputhost.exe", "lockapp.exe", "dwm.exe"];
+// (ApplicationFrameHost is not listed: Game Pass / Microsoft Store games run in its windows, and a window that
+// covers the whole monitor is not the Settings app anyway.)
+const NOT_GAMES: [&str; 7] = ["explorer.exe", "searchhost.exe", "startmenuexperiencehost.exe", "shellexperiencehost.exe", "textinputhost.exe", "lockapp.exe", "dwm.exe"];
+
+/// A few pixels of slack: borderless games are often a pixel or two short of the monitor.
+const FULLSCREEN_SLACK: i32 = 4;
 
 fn covers_monitor(w: &Window) -> bool {
     let (Some(m), Ok(r)) = (w.monitor(), w.rect()) else { return false };
     let (mw, mh) = (m.width().unwrap_or(0) as i32, m.height().unwrap_or(0) as i32);
-    mw > 0 && (r.right - r.left) >= mw && (r.bottom - r.top) >= mh
+    mw > 0 && (r.right - r.left) >= mw - FULLSCREEN_SLACK && (r.bottom - r.top) >= mh - FULLSCREEN_SLACK
+}
+
+/// For the log when nothing qualifies: the biggest visible windows and the size of the monitor they are on.
+fn describe_big_windows() -> String {
+    let mut v: Vec<(i64, String)> = Window::enumerate()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|w| w.is_valid())
+        .filter_map(|w| {
+            let area = w.width().ok()? as i64 * w.height().ok()? as i64;
+            let mon = w.monitor().and_then(|m| Some((m.width().ok()?, m.height().ok()?))).unwrap_or((0, 0));
+            Some((area, format!("{} {}x{} (monitor {}x{})", process_name_of(&w).unwrap_or_default(), w.width().unwrap_or(0), w.height().unwrap_or(0), mon.0, mon.1)))
+        })
+        .collect();
+    v.sort_by_key(|(a, _)| std::cmp::Reverse(*a));
+    v.into_iter().take(4).map(|(_, d)| d).collect::<Vec<_>>().join("; ")
 }
 
 /// The window to capture: the named program's biggest window, or (automatic)
@@ -247,10 +292,10 @@ fn find_game(program: &str) -> Option<Window> {
         return Window::enumerate()
             .unwrap_or_default()
             .into_iter()
-            .filter(|w| usable(w) && w.process_name().is_ok_and(|p| p.to_lowercase() == want))
+            .filter(|w| usable(w) && process_name_of(w).is_some_and(|p| p.to_lowercase() == want))
             .max_by_key(|w| w.width().unwrap_or(0) as i64 * w.height().unwrap_or(0) as i64);
     }
-    let not_shell = |w: &Window| w.process_name().is_ok_and(|p| !NOT_GAMES.contains(&p.to_lowercase().as_str()));
+    let not_shell = |w: &Window| process_name_of(w).is_none_or(|p| !NOT_GAMES.contains(&p.to_lowercase().as_str()));
     let front = Window::foreground().ok().filter(|w| usable(w) && not_shell(w) && covers_monitor(w));
     front.or_else(|| Window::enumerate().unwrap_or_default().into_iter().find(|w| usable(w) && not_shell(w) && covers_monitor(w)))
 }
@@ -263,11 +308,12 @@ pub struct GameSource {
     fps: u32,
     inner: Option<(WgcSource, u32, String)>,
     last_check: std::time::Instant,
+    last_report: Option<std::time::Instant>,
 }
 
 impl GameSource {
     pub fn new(program: &str, cursor: bool, fps: u32) -> Self {
-        Self { program: program.to_string(), cursor, fps, inner: None, last_check: std::time::Instant::now() - std::time::Duration::from_secs(10) }
+        Self { program: program.to_string(), cursor, fps, inner: None, last_check: std::time::Instant::now() - std::time::Duration::from_secs(10), last_report: None }
     }
 
     /// Looks for the game about once a second (cheap, but not every frame).
@@ -285,11 +331,23 @@ impl GameSource {
         if self.inner.is_some() && !self.program.trim().is_empty() {
             return;
         }
-        let Some(w) = find_game(&self.program) else { return };
+        let Some(w) = find_game(&self.program) else {
+            // Say why now and then, so "it isn't detecting my game" can be answered from the log.
+            if self.last_report.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(30)) {
+                self.last_report = Some(std::time::Instant::now());
+                if self.program.trim().is_empty() {
+                    log::info!("game capture: no full-screen window found; biggest windows: {}", describe_big_windows());
+                } else {
+                    log::info!("game capture: no window from {} found; biggest windows: {}", self.program, describe_big_windows());
+                }
+            }
+            return;
+        };
         let ident = (w.process_id().unwrap_or(0), w.title().unwrap_or_default());
         if self.inner.as_ref().is_some_and(|(_, pid, title)| *pid == ident.0 && *title == ident.1) {
             return;
         }
+        log::info!("game capture: capturing {} \"{}\"", process_name_of(&w).unwrap_or_default(), ident.1.chars().filter(|c| !c.is_control() && !matches!(c, '\u{200b}'..='\u{200f}' | '\u{feff}')).collect::<String>());
         match WgcSource::start(w, self.cursor, self.fps) {
             Ok(s) => self.inner = Some((s, ident.0, ident.1)),
             Err(e) => log::warn!("game capture: {e}"),
@@ -352,7 +410,7 @@ pub fn list_windows() -> Vec<WindowInfo> {
             if title.trim().is_empty() {
                 return None;
             }
-            Some(WindowInfo { title, process: w.process_name().unwrap_or_default() })
+            Some(WindowInfo { title, process: process_name_of(&w).unwrap_or_default() })
         })
         .collect()
 }

@@ -350,18 +350,20 @@ impl LinkSender {
         let (frames_tx, frames_rx) = crossbeam_channel::bounded::<VideoFrame>(1);
         let mut encoder_proc = None;
         match cfg.codec.clone() {
-            LinkCodec::Jpeg { quality, adaptive } => {
+            LinkCodec::Jpeg { quality, adaptive, full_chroma } => {
                 // obs-teleport's design: several workers each encode a whole
                 // frame, so throughput scales with cores while every frame
                 // is one simple JPEG; an orderer sends them strictly in order.
-                let workers = thread::available_parallelism().map_or(4, |n| n.get() / 2).clamp(2, 8);
-                let (job_tx, job_rx) = crossbeam_channel::bounded::<(u64, u64, VideoFrame, u8)>(workers);
+                // Like obs-teleport (a goroutine per frame on every core): all cores but one, and room for a
+                // short burst to queue instead of frames being skipped while every worker is busy.
+                let workers = thread::available_parallelism().map_or(4, |n| n.get().saturating_sub(1)).clamp(2, 16);
+                let (job_tx, job_rx) = crossbeam_channel::bounded::<(u64, u64, VideoFrame, u8)>(workers * 2);
                 let (done_tx, done_rx) = crossbeam_channel::unbounded::<(u64, Vec<u8>, Video)>();
                 let (w, h) = (cfg.width, cfg.height);
                 for i in 0..workers {
                     let (job_rx, done_tx) = (job_rx.clone(), done_tx.clone());
                     threads.push(thread::Builder::new().name(format!("link-jpeg-{i}")).spawn(move || {
-                        let mut enc = match codec::JpegEncoder::new() {
+                        let mut enc = match codec::JpegEncoder::with_chroma(full_chroma) {
                             Ok(e) => e,
                             Err(e) => return log::error!("Ferrous Link: JPEG encoder: {e}"),
                         };
@@ -498,7 +500,17 @@ impl LinkSender {
                 if encoder == "libx264" || encoder == "libx265" {
                     args.extend(["-tune".into(), "zerolatency".into()]);
                 } else if encoder.ends_with("_nvenc") {
-                    args.extend(["-tune".into(), "ll".into(), "-zerolatency".into(), "1".into()]);
+                    // The recording settings above add a 20-frame lookahead, which holds frames back and
+                    // releases them in bursts (stutter on the receiver); `-delay 0` makes NVENC hand each
+                    // frame out as soon as it is encoded. "hq" with no B-frames or lookahead keeps the latency
+                    // low and looks clearly better than the "ll" tune at the same bitrate.
+                    args.extend(
+                        ["-tune", "hq", "-zerolatency", "1", "-delay", "0", "-rc-lookahead", "0", "-temporal-aq", "0", "-bf", "0"]
+                            .iter()
+                            .map(|s| s.to_string()),
+                    );
+                } else if encoder.ends_with("_qsv") || encoder.ends_with("_amf") {
+                    args.extend(["-bf", "0"].iter().map(|s| s.to_string()));
                 }
                 args.extend(["-f", "mpegts", "-flush_packets", "1", "-muxdelay", "0", "pipe:1"].iter().map(|s| s.to_string()));
                 let mut child = ferrous_encode::ffmpeg::command(&cfg.ffmpeg)

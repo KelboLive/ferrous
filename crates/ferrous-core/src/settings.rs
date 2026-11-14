@@ -184,8 +184,8 @@ pub struct VideoSettings {
     pub pipelined_readback: bool,
     /// Ask Windows to schedule Ferrous's GPU work ahead of other programs'
     /// (a game's), which cuts rendering lag when the game maxes the GPU.
-    /// Works best when Ferrous runs as administrator.
-    #[serde(default)]
+    /// Works best when Ferrous runs as administrator. On by default, as in OBS.
+    #[serde(default = "yes")]
     pub gpu_priority: bool,
     /// Windows capture keeps the picture on the GPU (shared texture) instead of copying every frame
     /// to the CPU; the GPU compositor draws it directly. Experimental; Ferrous falls back to the CPU
@@ -224,7 +224,7 @@ impl Default for VideoSettings {
             vertical: None,
             conversion: ConversionMode::Auto,
             pipelined_readback: true,
-            gpu_priority: false, gpu_capture: false,
+            gpu_priority: true, gpu_capture: false,
         }
     }
 }
@@ -595,8 +595,14 @@ impl Default for UiSettings {
 #[serde(tag = "codec", rename_all = "snake_case")]
 pub enum LinkCodec {
     /// Parallel JPEG: lowest latency, moderate bandwidth. `adaptive` lowers
-    /// quality automatically when a receiver can't keep up.
-    Jpeg { quality: u8, adaptive: bool },
+    /// quality automatically when a receiver can't keep up. `full_chroma` keeps colour at full resolution
+    /// (4:4:4: sharper coloured text and HUD edges, about twice the encode work); off sends 4:2:0 like obs-teleport.
+    Jpeg {
+        quality: u8,
+        adaptive: bool,
+        #[serde(default)]
+        full_chroma: bool,
+    },
     /// Exact pixels including alpha (LZ4 + frame deltas): best for overlays.
     Lossless,
     /// FFmpeg encoder (e.g. h264_nvenc): lowest bandwidth, a little more latency.
@@ -639,7 +645,7 @@ impl Default for LinkOutputSettings {
             enabled: false,
             name: "Ferrous Link".into(),
             target: LinkSourceTarget::Program,
-            codec: LinkCodec::Jpeg { quality: 92, adaptive: true },
+            codec: LinkCodec::Jpeg { quality: 92, adaptive: true, full_chroma: false },
             width: 0,
             height: 0,
             fps: 0,
