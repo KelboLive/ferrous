@@ -77,6 +77,7 @@ const INDEX: &[(&str, Tab, &str)] = &[
     ("Color conversion", Tab::Video, "yuv nv12 ffmpeg ferrous"),
     ("GPU readback and priority", Tab::Video, "lag latency game pipelined"),
     ("GPU capture", Tab::Video, "gpu resident capture shared texture cpu copy"),
+    ("Zero-copy encoding", Tab::Video, "nvenc gpu encoder zero copy in-process ffmpeg pipe"),
     ("Desktop and microphone devices", Tab::Audio, "input output speaker wasapi"),
     ("Audio delay (sync offset)", Tab::Audio, "lip sync latency"),
     ("Hotkeys", Tab::Hotkeys, "shortcut keyboard keys bind"),
@@ -542,6 +543,10 @@ impl SettingsWindow {
             crate::widgets::row_label(ui, "GPU capture");
             ui.checkbox(&mut v.gpu_capture, "Keep display and game capture on the GPU (experimental)")
                 .on_hover_text("Skips the copy of every captured frame to system memory: the picture goes from the capture straight into the GPU renderer. It lowers CPU use and memory traffic, most at 1440p/4K and high frame rates. Sources that need the pixels on the CPU (plugin filters, background removal, nested scenes) use the normal path automatically, and so does everything if your graphics setup can't share textures. Needs the GPU renderer. Takes effect on restart.");
+            ui.end_row();
+            crate::widgets::row_label(ui, "Zero-copy encoding");
+            ui.checkbox(&mut v.zero_copy_encoding, "Encode on the GPU without copying frames (NVIDIA)")
+                .on_hover_text("Recording, streaming and the replay buffer encode with NVENC inside Ferrous, straight from the picture on the graphics card, the way OBS does; FFmpeg only writes the file or sends the stream. Much less CPU and memory traffic. Used with NVIDIA encoders on the GPU renderer; anything else, or any problem starting it, uses the FFmpeg path automatically. Turn off if a recording misbehaves. Applies to the next recording or stream.");
             ui.end_row();
         });
         // Encoders want even dimensions for 4:2:0 chroma.

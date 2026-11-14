@@ -17,6 +17,7 @@ use windows_capture::settings::{
 use windows_capture::window::Window;
 
 use crate::gpu_ring::Ring;
+use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use crate::{MonitorInfo, Source, WindowInfo};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -57,11 +58,20 @@ struct Shared {
     /// while someone wants it (a filter or consumer the GPU path can't serve).
     cpu_wanted: Arc<AtomicU64>,
     epoch: std::time::Instant,
+    /// Set when the display is in HDR: capture scRGB and tone-map it, with this SDR white (nits).
+    hdr_white: Option<f32>,
 }
 
 impl Shared {
+    /// GPU capture is on globally and hasn't failed for this source. The global switch is read live:
+    /// a capture can start before the render thread applies the setting (game capture did, so it
+    /// silently stayed on the CPU path).
+    fn gpu_on(&self) -> bool {
+        crate::gpu_capture() && self.gpu.load(Ordering::Relaxed)
+    }
+
     fn cpu_needed(&self) -> bool {
-        if !self.gpu.load(Ordering::Relaxed) {
+        if !self.gpu_on() {
             return true;
         }
         let last = self.cpu_wanted.load(Ordering::Relaxed);
@@ -73,17 +83,22 @@ struct Handler {
     shared: Shared,
     pool: ferrous_core::FramePool,
     ring: Option<Ring>,
+    /// HDR displays only: scRGB -> SDR on the GPU.
+    tonemap: Option<crate::hdr::ToneMapper>,
 }
 
 impl Handler {
     /// Copies the captured texture into the shared ring (GPU to GPU) and publishes it.
-    fn publish_gpu(&mut self, frame: &Frame) -> Result<(), BoxError> {
+    fn publish_gpu(&mut self, frame: &Frame, tex: Option<&ID3D11Texture2D>) -> Result<(), BoxError> {
         let (w, h) = (frame.width(), frame.height());
         if self.ring.as_ref().is_none_or(|r| r.size() != (w, h)) {
             self.ring = Some(Ring::new(frame.device(), w, h)?);
         }
         let ring = self.ring.as_mut().expect("ring just made");
-        if let Some(f) = ring.publish(frame.device_context(), frame.as_raw_texture())? {
+        if let Some(f) = ring.publish(frame.device_context(), tex.unwrap_or(frame.as_raw_texture()))? {
+            if self.shared.latest_gpu.lock().is_none() {
+                log::info!("GPU capture: sharing captured frames on the GPU ({w}x{h})");
+            }
             *self.shared.latest_gpu.lock() = Some(f);
         }
         Ok(())
@@ -95,7 +110,7 @@ impl GraphicsCaptureApiHandler for Handler {
     type Error = BoxError;
 
     fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-        Ok(Self { shared: ctx.flags, pool: ferrous_core::FramePool::default(), ring: None })
+        Ok(Self { shared: ctx.flags, pool: ferrous_core::FramePool::default(), ring: None, tonemap: None })
     }
 
     fn on_frame_arrived(
@@ -103,8 +118,20 @@ impl GraphicsCaptureApiHandler for Handler {
         frame: &mut Frame,
         _control: InternalCaptureControl,
     ) -> Result<(), Self::Error> {
-        if self.shared.gpu.load(Ordering::Relaxed) {
-            if let Err(e) = self.publish_gpu(frame) {
+        // On an HDR display the capture is scRGB: tone-map it to an ordinary BGRA picture first.
+        let mapped = match self.shared.hdr_white {
+            Some(white) => {
+                if self.tonemap.is_none() {
+                    self.tonemap = Some(crate::hdr::ToneMapper::new(frame.device(), white)?);
+                }
+                let (w, h) = (frame.width(), frame.height());
+                let tm = self.tonemap.as_mut().expect("made above");
+                Some(tm.run(frame.device(), frame.device_context(), frame.as_raw_texture(), w, h)?)
+            }
+            None => None,
+        };
+        if self.shared.gpu_on() {
+            if let Err(e) = self.publish_gpu(frame, mapped.as_ref()) {
                 // Whatever went wrong, the ordinary CPU path still works: use it from now on.
                 log::warn!("GPU capture failed, using the CPU path: {e}");
                 self.shared.gpu.store(false, Ordering::Relaxed);
@@ -113,6 +140,17 @@ impl GraphicsCaptureApiHandler for Handler {
             }
         }
         if !self.shared.cpu_needed() {
+            return Ok(());
+        }
+        if mapped.is_some() {
+            let (w, h) = (frame.width(), frame.height());
+            let row = w as usize * 4;
+            let (mut pixels, _) = self.pool.take(row * h as usize);
+            let tm = self.tonemap.as_mut().expect("made with `mapped`");
+            tm.read(frame.device(), frame.device_context(), |y, src| pixels[y * row..(y + 1) * row].copy_from_slice(src))?;
+            let f = VideoFrame::new(w, h, pixels);
+            self.pool.track(&f);
+            *self.shared.latest.lock() = Some(f);
             return Ok(());
         }
         let mut buffer = frame.buffer()?;
@@ -175,10 +213,13 @@ impl WgcSource {
             latest: Arc::new(Mutex::new(None)),
             latest_gpu: Arc::new(Mutex::new(None)),
             alive: Arc::new(AtomicBool::new(true)),
-            gpu: Arc::new(AtomicBool::new(crate::gpu_capture())),
+            // "Not failed": whether GPU capture is wanted at all is `crate::gpu_capture()`, read live.
+            gpu: Arc::new(AtomicBool::new(true)),
             cpu_wanted: Arc::new(AtomicU64::new(0)),
             epoch: std::time::Instant::now(),
+            hdr_white: crate::hdr::hdr_display(),
         };
+        let color = if shared.hdr_white.is_some() { ColorFormat::Rgba16F } else { ColorFormat::Bgra8 };
         let settings = Settings::new(
             item,
             cursor(capture_cursor),
@@ -191,7 +232,7 @@ impl WgcSource {
             SecondaryWindowSettings::Default,
             min_interval(canvas_fps),
             DirtyRegionSettings::Default,
-            ColorFormat::Bgra8,
+            color,
             shared.clone(),
         );
         let control = Handler::start_free_threaded(settings)
@@ -222,7 +263,7 @@ impl WgcSource {
 
 impl Source for WgcSource {
     fn latest_frame(&mut self) -> Option<VideoFrame> {
-        if self.shared.gpu.load(Ordering::Relaxed) {
+        if self.shared.gpu_on() {
             // A consumer that can't use the GPU frame: start (and keep) making CPU frames.
             self.shared.cpu_wanted.store((self.shared.epoch.elapsed().as_millis() as u64).max(1), Ordering::Relaxed);
         }
@@ -230,7 +271,7 @@ impl Source for WgcSource {
     }
 
     fn latest_gpu_frame(&mut self) -> Option<VideoFrame> {
-        if !self.shared.gpu.load(Ordering::Relaxed) {
+        if !self.shared.gpu_on() {
             return None;
         }
         self.shared.latest_gpu.lock().clone()

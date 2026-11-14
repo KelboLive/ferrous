@@ -28,6 +28,9 @@ pub struct SenderConfig {
     pub pin: String,
     pub audio: bool,
     pub ffmpeg: PathBuf,
+    /// Hardware codec only: the compressed stream (MPEG-TS) comes from Ferrous's in-process GPU
+    /// encoder through [`LinkSender::stream_input`] instead of an FFmpeg process fed with frames.
+    pub external_stream: bool,
 }
 
 /// Live numbers for the UI and the stats dock.
@@ -43,6 +46,8 @@ pub struct SenderStats {
     /// Current JPEG quality (adaptive).
     pub quality: AtomicU32,
     pub kbps: AtomicU32,
+    /// JPEGs made straight from the GPU's YCbCr (no BGRA read-back, no colour conversion).
+    pub frames_from_gpu_yuv: AtomicU64,
 }
 
 /// One receiver's outgoing queues.
@@ -97,6 +102,32 @@ pub struct LinkSender {
     stop: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
     encoder_proc: Option<Arc<Mutex<Child>>>,
+    external: Option<Sender<Vec<u8>>>,
+}
+
+/// Reads the chunks sent through a channel as one byte stream (the in-process encoder's MPEG-TS).
+struct ChanReader {
+    rx: crossbeam_channel::Receiver<Vec<u8>>,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl std::io::Read for ChanReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.buf.len() {
+            match self.rx.recv() {
+                Ok(b) => {
+                    self.buf = b;
+                    self.pos = 0;
+                }
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = out.len().min(self.buf.len() - self.pos);
+        out[..n].copy_from_slice(&self.buf[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
 }
 
 fn codec_kind(c: &LinkCodec) -> CodecKind {
@@ -349,6 +380,12 @@ impl LinkSender {
         // Encoder.
         let (frames_tx, frames_rx) = crossbeam_channel::bounded::<VideoFrame>(1);
         let mut encoder_proc = None;
+        let (external, mut external_rx) = if cfg.external_stream && matches!(cfg.codec, LinkCodec::Hardware { .. }) {
+            let (t, r) = crossbeam_channel::bounded::<Vec<u8>>(256);
+            (Some(t), Some(r))
+        } else {
+            (None, None)
+        };
         match cfg.codec.clone() {
             LinkCodec::Jpeg { quality, adaptive, full_chroma } => {
                 // obs-teleport's design: several workers each encode a whole
@@ -361,15 +398,26 @@ impl LinkSender {
                 let (done_tx, done_rx) = crossbeam_channel::unbounded::<(u64, Vec<u8>, Video)>();
                 let (w, h) = (cfg.width, cfg.height);
                 for i in 0..workers {
-                    let (job_rx, done_tx) = (job_rx.clone(), done_tx.clone());
+                    let (job_rx, done_tx, wstats) = (job_rx.clone(), done_tx.clone(), stats.clone());
                     threads.push(thread::Builder::new().name(format!("link-jpeg-{i}")).spawn(move || {
                         let mut enc = match codec::JpegEncoder::with_chroma(full_chroma) {
                             Ok(e) => e,
                             Err(e) => return log::error!("Ferrous Link: JPEG encoder: {e}"),
                         };
                         for (seq, ts, f, q) in job_rx {
-                            let f = codec::scale(&f, w, h);
-                            match enc.encode(&f, q, ts) {
+                            // The GPU already made JPEG's YCbCr at this size (as OBS hands obs-teleport
+                            // its I420): compress that, no BGRA involved.
+                            let r = match f.nv12.as_ref() {
+                                Some(yuv) if f.nv12_jfif && !full_chroma && (f.width, f.height) == (w, h) => {
+                                    static ONCE: std::sync::Once = std::sync::Once::new();
+                                    ONCE.call_once(|| log::info!("Ferrous Link: JPEG straight from the GPU's YCbCr (no BGRA read-back)"));
+                                    wstats.frames_from_gpu_yuv.fetch_add(1, Ordering::Relaxed);
+                                    enc.encode_jfif_nv12(w, h, yuv, q, ts)
+                                }
+                                _ if f.data.is_empty() => Err(anyhow::anyhow!("frame has no pixels")),
+                                _ => enc.encode(&codec::scale(&f, w, h), q, ts),
+                            };
+                            match r {
                                 Ok(payload) => {
                                     let _ = done_tx.send((seq, protocol::frame(kind::VIDEO, &payload), Video::Independent));
                                 }
@@ -413,10 +461,12 @@ impl LinkSender {
                         // instead of a new JPEG. A receiver that just joined
                         // needs a real picture first.
                         let joined = force_key.swap(false, Ordering::Relaxed);
-                        if !joined && last.as_ref().is_some_and(|l| Arc::ptr_eq(l, &f.data)) {
+                        // (A frame with only GPU-made YCbCr is identified by that buffer.)
+                        let pixels = if f.data.is_empty() { f.nv12.clone().unwrap_or_else(|| f.data.clone()) } else { f.data.clone() };
+                        if !joined && last.as_ref().is_some_and(|l| Arc::ptr_eq(l, &pixels)) {
                             let _ = done_tx.send((seq, protocol::frame(kind::REPEAT, &ts.to_be_bytes()), Video::Repeat));
                         } else {
-                            last = Some(f.data.clone());
+                            last = Some(pixels);
                             // Blocks while every worker is busy; meanwhile new
                             // frames are skipped at push_frame (and counted).
                             if job_tx.send((seq, ts, f, q)).is_err() {
@@ -488,6 +538,10 @@ impl LinkSender {
                 // carries 1.5 bytes per pixel instead of 4 and FFmpeg's
                 // single-threaded converter is skipped; hardware encoders
                 // take NV12 as it is.
+                let mut stdout: Box<dyn Read + Send> = if let Some(rx) = external_rx.take() {
+                    let _ = (&es, &frames_rx);
+                    Box::new(ChanReader { rx, buf: Vec::new(), pos: 0 })
+                } else {
                 let (w, h) = ((cfg.width & !1).max(2), (cfg.height & !1).max(2));
                 let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "nv12"].iter().map(|s| s.to_string()).collect();
                 args.extend(["-s".into(), format!("{w}x{h}"), "-r".into(), fps.to_string(), "-i".into(), "pipe:0".into()]);
@@ -521,7 +575,7 @@ impl LinkSender {
                     .spawn()
                     .map_err(|e| anyhow::anyhow!("couldn't start FFmpeg for Ferrous Link: {e}"))?;
                 let mut stdin = child.stdin.take().unwrap();
-                let mut stdout = child.stdout.take().unwrap();
+                let stdout = child.stdout.take().unwrap();
                 let child = Arc::new(Mutex::new(child));
                 encoder_proc = Some(child);
                 let stats2 = stats.clone();
@@ -531,7 +585,7 @@ impl LinkSender {
                     let mut last: Option<Arc<Vec<u8>>> = None;
                     for f in frames_rx {
                         // The GPU compositor may have converted it already.
-                        if let Some(ready) = f.nv12.as_ref().filter(|n| (f.width, f.height) == (w, h) && n.len() == ferrous_output::convert::frame_bytes(w, h)) {
+                        if let Some(ready) = f.nv12.as_ref().filter(|n| !f.nv12_jfif && (f.width, f.height) == (w, h) && n.len() == ferrous_output::convert::frame_bytes(w, h)) {
                             if stdin.write_all(ready).is_err() {
                                 break;
                             }
@@ -555,6 +609,8 @@ impl LinkSender {
                         stats2.frames_sent.fetch_add(1, Ordering::Relaxed);
                     }
                 })?);
+                Box::new(stdout)
+                };
                 let (clients, stats) = (clients.clone(), stats.clone());
                 threads.push(thread::Builder::new().name("link-stream".into()).spawn(move || {
                     let mut buf = vec![0u8; 64 * 1024];
@@ -611,11 +667,25 @@ impl LinkSender {
             }));
         }
 
-        Ok(Self { port, stats, frames: frames_tx, clients, stop, threads, encoder_proc })
+        Ok(Self { port, stats, frames: frames_tx, clients, stop, threads, encoder_proc, external })
+    }
+
+    /// Where the in-process encoder's MPEG-TS goes ([`SenderConfig::external_stream`]).
+    pub fn stream_input(&self) -> Option<Sender<Vec<u8>>> {
+        self.external.clone()
+    }
+
+    /// Whether anyone is connected (an in-process encoder can skip work while nobody watches).
+    pub fn has_clients(&self) -> bool {
+        self.stats.clients.load(Ordering::Relaxed) > 0
     }
 
     /// Offers a frame; skipped if the encoder is still busy with the last one.
     pub fn push_frame(&self, frame: &VideoFrame) {
+        // Fed straight from the GPU encoder instead.
+        if self.external.is_some() {
+            return;
+        }
         // Nobody watching: don't spend CPU encoding, hardware or not. (The
         // hardware encoder just waits on its pipe, and a receiver that joins
         // starts on the next keyframe, at most a second later.)

@@ -101,6 +101,146 @@ struct Params {
     canvas: [f32; 4],
 }
 
+/// Checks once whether NVIDIA's encoder can run inside Ferrous on the compositor's own D3D12 device
+/// (the first step towards zero-copy encoding); the answer goes to the log.
+#[cfg(windows)]
+fn probe_nvenc(device: &wgpu::Device) {
+    use windows::core::Interface;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: the hal device is only borrowed for the duration of the probe, which opens and
+        // closes its encode session before returning.
+        unsafe {
+            if let Some(hal) = device.as_hal::<wgpu::hal::api::Dx12>() {
+                ferrous_nvenc::probe(hal.raw_device().as_raw());
+            }
+        }
+    });
+}
+
+/// An encoder plus wgpu views of its shared canvas slots.
+#[cfg(windows)]
+struct AttachedEncoder {
+    enc: ferrous_nvenc::encoder::GpuEncoder,
+    slots: Vec<wgpu::Texture>,
+}
+
+impl GpuCompositor {
+    /// Whether the NV12 is JPEG's YCbCr (BT.601 full range) instead of video's (see the field).
+    pub fn set_nv12_jfif(&mut self, on: bool) {
+        self.nv12_jfif = on;
+    }
+
+    /// Whether compositions copy the picture back as BGRA (see the field). Default on.
+    pub fn set_want_bgra(&mut self, on: bool) {
+        self.want_bgra = on;
+    }
+
+    /// Marks the next composition as the program picture for output frame `pts` (or none).
+    pub fn set_encode_pts(&mut self, pts: Option<u64>) {
+        self.encode_pts = pts;
+    }
+
+    /// Starts an in-process hardware encoder fed from the canvas (zero copy). Only on Windows with
+    /// the D3D12 backend and an NVIDIA GPU; the error says why otherwise.
+    pub fn add_encoder(&mut self, config: ferrous_nvenc::Config, sink: ferrous_nvenc::Sink) -> anyhow::Result<std::sync::Arc<ferrous_nvenc::Stats>> {
+        #[cfg(windows)]
+        {
+            anyhow::ensure!(self.shared_ok, "the compositor isn't on Direct3D 12");
+            anyhow::ensure!(config.input == (self.width, self.height), "encoder input must be the canvas size");
+            // SAFETY: the hal device is borrowed only while the encoder is created; the encoder keeps
+            // its own references to everything it shares with this device.
+            let enc = unsafe {
+                let hal = self.device.as_hal::<wgpu::hal::api::Dx12>().ok_or_else(|| anyhow::anyhow!("not a D3D12 device"))?;
+                ferrous_nvenc::encoder::GpuEncoder::new(hal.raw_device(), config, sink)?
+            };
+            let size = wgpu::Extent3d { width: self.width, height: self.height, depth_or_array_layers: 1 };
+            let desc = wgpu::TextureDescriptor {
+                label: Some("encoder slot"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                usage: wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            };
+            let slots = enc
+                .slot_resources()
+                .iter()
+                .map(|r| {
+                    // SAFETY: a BGRA texture of the canvas size, kept alive by the encoder (and by
+                    // the extra reference given to wgpu here).
+                    unsafe {
+                        let hal_tex = wgpu::hal::dx12::Device::texture_from_raw(r.clone(), wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureDimension::D2, size, 1, 1);
+                        self.device.create_texture_from_hal::<wgpu::hal::api::Dx12>(hal_tex, &desc, wgpu::TextureUses::COPY_DST)
+                    }
+                })
+                .collect();
+            let stats = enc.stats.clone();
+            self.encoders.push(AttachedEncoder { enc, slots });
+            Ok(stats)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (config, sink);
+            anyhow::bail!("in-process hardware encoding is only available on Windows")
+        }
+    }
+
+    /// Once per output frame, after the program picture: repeats the last picture for encoders that
+    /// didn't get a new one, and drops encoders whose output has ended.
+    pub fn encoders_tick(&mut self, pts: u64) {
+        #[cfg(windows)]
+        {
+            for a in &mut self.encoders {
+                a.enc.tick(pts);
+            }
+            self.encoders.retain(|a| {
+                let alive = a.enc.is_alive();
+                if !alive {
+                    log::info!("GPU encoder stopped ({} frames, {} repeated, {} skipped)", a.enc.stats.frames.load(std::sync::atomic::Ordering::Relaxed), a.enc.stats.repeats.load(std::sync::atomic::Ordering::Relaxed), a.enc.stats.skipped.load(std::sync::atomic::Ordering::Relaxed));
+                }
+                alive
+            });
+        }
+        #[cfg(not(windows))]
+        let _ = pts;
+    }
+
+    pub fn encoder_count(&self) -> usize {
+        #[cfg(windows)]
+        return self.encoders.len();
+        #[cfg(not(windows))]
+        0
+    }
+
+    /// Copies the canvas into each encoder's next free slot (in `enc`, before it is submitted) and
+    /// stages the fence signal the encoder waits for.
+    #[cfg(windows)]
+    fn feed_encoders(&mut self, enc: &mut wgpu::CommandEncoder) -> Vec<(usize, ferrous_nvenc::encoder::Pending, u64)> {
+        let Some(pts) = self.encode_pts.take() else { return Vec::new() };
+        let mut fed = Vec::new();
+        let size = wgpu::Extent3d { width: self.width, height: self.height, depth_or_array_layers: 1 };
+        for (k, a) in self.encoders.iter_mut().enumerate() {
+            let Some(p) = a.enc.begin() else { continue };
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo { texture: &self.target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo { texture: &a.slots[p.slot], mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                size,
+            );
+            // SAFETY: staging a signal on wgpu's own D3D12 queue for its next submit (ours, right after).
+            unsafe {
+                if let Some(q) = self.queue.as_hal::<wgpu::hal::api::Dx12>() {
+                    q.add_signal_fence(a.enc.ready_fence().clone(), p.value);
+                }
+            }
+            fed.push((k, p, pts));
+        }
+        fed
+    }
+}
+
 fn params_buffer(device: &wgpu::Device, stride: u64, slots: usize) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("params"),
@@ -179,6 +319,17 @@ pub struct GpuCompositor {
     /// Timestamp queries around the compositing pass, when supported.
     timing: Option<(wgpu::QuerySet, wgpu::Buffer, f32)>,
     last_gpu_ms: Option<f32>,
+    /// In-process hardware encoders fed straight from the canvas texture (Windows, D3D12).
+    #[cfg(windows)]
+    encoders: Vec<AttachedEncoder>,
+    /// Set while the program picture is being composed: its output-frame number.
+    encode_pts: Option<u64>,
+    /// Copy the finished picture back as BGRA. Off when nothing on the CPU needs the picture itself
+    /// this frame (only NV12 for an encoder, or only the GPU encoders): the 4-bytes-a-pixel read-back
+    /// is the biggest per-frame cost of the GPU path.
+    want_bgra: bool,
+    /// Make the NV12 in JPEG's YCbCr (for the JPEG Link) instead of video's.
+    nv12_jfif: bool,
 }
 
 impl GpuCompositor {
@@ -189,9 +340,11 @@ impl GpuCompositor {
     }
 
     pub fn new(width: u32, height: u32) -> anyhow::Result<Self> {
-        // GPU-resident capture shares textures through DX12, so ask for that first and take whatever
-        // else is there if it isn't (the engine then uses CPU frames).
-        if cfg!(windows) && PREFER_DX12.load(std::sync::atomic::Ordering::Relaxed) {
+        // GPU-resident capture and in-process encoding both work through D3D12 (as OBS's own renderer
+        // works through Direct3D), so on Windows ask for it first and take whatever else is there if it
+        // isn't (the engine then uses CPU frames and FFmpeg's encoders). `WGPU_BACKEND` still overrides.
+        let _ = PREFER_DX12.load(std::sync::atomic::Ordering::Relaxed);
+        if cfg!(windows) && std::env::var_os("WGPU_BACKEND").is_none() {
             if let Ok(g) = Self::new_on(width, height, Some(wgpu::Backends::DX12)) {
                 return Ok(g);
             }
@@ -344,10 +497,16 @@ impl GpuCompositor {
                 done: Arc::new(AtomicUsize::new(0)),
                 expect: 0,
                 has_nv12: false,
+                nv12_jfif: false,
+                has_bgra: false,
                 sub: None,
             })
             .collect();
         log::info!("GPU compositor on {adapter_name}");
+        #[cfg(windows)]
+        if adapter_is_dx12 {
+            probe_nvenc(&device);
+        }
         let align = u64::from(device.limits().min_uniform_buffer_offset_alignment).max(1);
         let ubo_stride = (std::mem::size_of::<Params>() as u64).div_ceil(align) * align;
         let ubo = params_buffer(&device, ubo_stride, 8);
@@ -378,6 +537,11 @@ impl GpuCompositor {
             software,
             timing,
             last_gpu_ms: None,
+            #[cfg(windows)]
+            encoders: Vec::new(),
+            encode_pts: None,
+            want_bgra: true,
+            nv12_jfif: false,
         })
     }
 
@@ -701,14 +865,18 @@ impl GpuCompositor {
 
     /// Whether the NV12 passes are ready (the canvas needs even sides).
     fn ensure_nv12(&mut self) -> bool {
-        if self.nv12.is_some() {
+        if let Some(p) = &self.nv12 {
+            if p.jfif != self.nv12_jfif {
+                // Other colour formula, same sizes: the slots' buffers stay.
+                self.nv12 = Some(Nv12Pass::new(&self.device, &self.target, self.width, self.height, self.nv12_jfif));
+            }
             return true;
         }
         let (w, h) = (self.width, self.height);
         if !w.is_multiple_of(2) || !h.is_multiple_of(2) || w < 2 || h < 2 {
             return false;
         }
-        let pass = Nv12Pass::new(&self.device, &self.target, w, h);
+        let pass = Nv12Pass::new(&self.device, &self.target, w, h, self.nv12_jfif);
         for s in &mut self.slots {
             s.planes = Some((
                 map_buffer(&self.device, "nv12 y", (pass.y_row * h) as u64),
@@ -747,15 +915,18 @@ impl GpuCompositor {
             }
         }
         let (w, h) = (self.width, self.height);
+        let bgra = self.want_bgra;
         let s = &self.slots[slot];
-        enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: &self.target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &s.bgra,
-                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(self.padded_row), rows_per_image: Some(h) },
-            },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        );
+        if bgra {
+            enc.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: &self.target, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &s.bgra,
+                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(self.padded_row), rows_per_image: Some(h) },
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+        }
         if nv12 {
             if let (Some(n), Some((yb, uvb))) = (&self.nv12, &s.planes) {
                 n.encode(&mut enc, yb, uvb, w, h);
@@ -765,7 +936,13 @@ impl GpuCompositor {
             enc.resolve_query_set(qs, 0..2, resolve, 0);
             enc.copy_buffer_to_buffer(resolve, 0, ts, 0, 16);
         }
+        #[cfg(windows)]
+        let fed = self.feed_encoders(&mut enc);
         let sub = self.queue.submit([enc.finish()]);
+        #[cfg(windows)]
+        for (k, p, pts) in fed {
+            self.encoders[k].enc.submitted(p, pts);
+        }
 
         let s = &mut self.slots[slot];
         s.done.store(0, Ordering::SeqCst);
@@ -777,7 +954,9 @@ impl GpuCompositor {
             });
             expect += 1;
         };
-        map(&s.bgra);
+        if bgra {
+            map(&s.bgra);
+        }
         if let Some(ts) = &s.ts {
             map(ts);
         }
@@ -789,6 +968,8 @@ impl GpuCompositor {
         }
         s.expect = expect;
         s.has_nv12 = nv12;
+        s.nv12_jfif = nv12 && self.nv12.as_ref().is_some_and(|p| p.jfif);
+        s.has_bgra = bgra;
         s.sub = Some(sub);
     }
 
@@ -806,7 +987,9 @@ impl GpuCompositor {
 
     fn unmap_slot(&self, slot: usize) {
         let s = &self.slots[slot];
-        s.bgra.unmap();
+        if s.has_bgra {
+            s.bgra.unmap();
+        }
         if let Some(t) = &s.ts {
             t.unmap();
         }
@@ -834,8 +1017,10 @@ impl GpuCompositor {
         let row = (self.width * 4) as usize;
         let mut out = buf;
         out.clear();
-        out.reserve(row * self.height as usize);
-        {
+        if s.has_bgra {
+            out.reserve(row * self.height as usize);
+        }
+        if s.has_bgra {
             let Ok(data) = s.bgra.slice(..).get_mapped_range() else {
                 self.unmap_slot(slot);
                 return VideoFrame::new(self.width, self.height, vec![0u8; row * self.height as usize]);
@@ -845,7 +1030,8 @@ impl GpuCompositor {
                 out.extend_from_slice(&data[y * self.padded_row as usize..][..row]);
             }
         }
-        let mut frame = VideoFrame::new(self.width, self.height, out);
+        // Without the BGRA read-back the frame has no CPU pixels (only NV12, if that was asked for).
+        let mut frame = if s.has_bgra { VideoFrame::new(self.width, self.height, out) } else { VideoFrame { width: self.width, height: self.height, data: Arc::new(Vec::new()), nv12: None, nv12_jfif: false, gpu: None } };
         if let (true, Some(n), Some((yb, uvb))) = (s.has_nv12, &self.nv12, &s.planes) {
             let (w, h) = (self.width as usize, self.height as usize);
             let mut v = Vec::with_capacity(w * h * 3 / 2);
@@ -857,6 +1043,7 @@ impl GpuCompositor {
                     v.extend_from_slice(&uv[r * n.uv_row as usize..][..w]);
                 }
                 frame.nv12 = Some(Arc::new(v));
+                frame.nv12_jfif = s.nv12_jfif;
             }
         }
         if let Some(ts) = &s.ts {
@@ -882,6 +1069,10 @@ struct Slot {
     done: Arc<AtomicUsize>,
     expect: usize,
     has_nv12: bool,
+    /// The NV12 in this slot is JPEG's YCbCr.
+    nv12_jfif: bool,
+    /// The BGRA picture was copied back for this slot (see `GpuCompositor::want_bgra`).
+    has_bgra: bool,
     sub: Option<wgpu::SubmissionIndex>,
 }
 
@@ -908,6 +1099,8 @@ struct Nv12Pass {
     bind: wgpu::BindGroup,
     y_row: u32,
     uv_row: u32,
+    /// JPEG's YCbCr instead of video's.
+    jfif: bool,
 }
 
 const NV12_SHADER: &str = r#"
@@ -923,24 +1116,34 @@ fn vs(@builtin(vertex_index) i: u32) -> V {
     o.uv = vec2<f32>(x, y);
     return o;
 }
-fn luma(c: vec3<f32>) -> f32 { return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b; }
+fn luma(c: vec3<f32>) -> f32 { return KR * c.r + KG * c.g + KB * c.b; }
 @fragment
 fn fs_y(v: V) -> @location(0) vec4<f32> {
     let c = textureSample(src, samp, v.uv).rgb;
-    return vec4<f32>((16.0 + 219.0 * luma(c)) / 255.0, 0.0, 0.0, 1.0);
+    return vec4<f32>((YOFF + YSCALE * luma(c)) / 255.0, 0.0, 0.0, 1.0);
 }
 @fragment
 fn fs_uv(v: V) -> @location(0) vec4<f32> {
     let c = textureSample(src, samp, v.uv).rgb;
     let y = luma(c);
-    let cb = (c.b - y) / 1.8556;
-    let cr = (c.r - y) / 1.5748;
-    return vec4<f32>((128.0 + 224.0 * cb) / 255.0, (128.0 + 224.0 * cr) / 255.0, 0.0, 1.0);
+    let cb = (c.b - y) / CBDIV;
+    let cr = (c.r - y) / CRDIV;
+    return vec4<f32>((128.0 + CSCALE * cb) / 255.0, (128.0 + CSCALE * cr) / 255.0, 0.0, 1.0);
 }
 "#;
 
+/// The NV12 shader for video (BT.709, limited range) or for JPEG (BT.601, full range: JFIF).
+fn nv12_shader(jfif: bool) -> String {
+    let (kr, kg, kb, yoff, yscale, cscale, cbdiv, crdiv) =
+        if jfif { (0.299, 0.587, 0.114, 0.0, 255.0, 255.0, 1.772, 1.402) } else { (0.2126, 0.7152, 0.0722, 16.0, 219.0, 224.0, 1.8556, 1.5748) };
+    let consts = format!(
+        "const KR: f32 = {kr:?};\nconst KG: f32 = {kg:?};\nconst KB: f32 = {kb:?};\nconst YOFF: f32 = {yoff:?};\nconst YSCALE: f32 = {yscale:?};\nconst CSCALE: f32 = {cscale:?};\nconst CBDIV: f32 = {cbdiv:?};\nconst CRDIV: f32 = {crdiv:?};\n"
+    );
+    consts + NV12_SHADER
+}
+
 impl Nv12Pass {
-    fn new(device: &wgpu::Device, target: &wgpu::Texture, w: u32, h: u32) -> Self {
+    fn new(device: &wgpu::Device, target: &wgpu::Texture, w: u32, h: u32, jfif: bool) -> Self {
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let tex = |label: &str, w: u32, h: u32, format| {
             device.create_texture(&wgpu::TextureDescriptor {
@@ -956,7 +1159,7 @@ impl Nv12Pass {
         };
         let y_tex = tex("nv12 y", w, h, wgpu::TextureFormat::R8Unorm);
         let uv_tex = tex("nv12 uv", w / 2, h / 2, wgpu::TextureFormat::Rg8Unorm);
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("nv12"), source: wgpu::ShaderSource::Wgsl(NV12_SHADER.into()) });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("nv12"), source: wgpu::ShaderSource::Wgsl(nv12_shader(jfif).into()) });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("nv12"),
             entries: &[
@@ -1022,6 +1225,7 @@ impl Nv12Pass {
             bind,
             y_row: w.div_ceil(align) * align,
             uv_row: w.div_ceil(align) * align,
+            jfif,
         }
     }
 

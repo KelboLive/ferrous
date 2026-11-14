@@ -13,6 +13,8 @@ mod appaudio;
 #[cfg(windows)]
 mod gpu_ring;
 #[cfg(windows)]
+mod hdr;
+#[cfg(windows)]
 mod wgc;
 
 use std::path::PathBuf;

@@ -1947,6 +1947,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrous-nvenc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossbeam-channel",
+ "libloading",
+ "log",
+ "parking_lot 0.12.5",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "ferrous-obs"
 version = "0.1.0"
 dependencies = [
@@ -2021,6 +2033,7 @@ dependencies = [
  "bytemuck",
  "ferrous-core",
  "ferrous-matte",
+ "ferrous-nvenc",
  "ferrous-plugins",
  "image",
  "log",

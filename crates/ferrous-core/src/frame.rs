@@ -14,6 +14,9 @@ pub struct VideoFrame {
     /// converting on the CPU; anything that changes `data` builds a new
     /// frame, which leaves this `None`.
     pub nv12: Option<Arc<Vec<u8>>>,
+    /// `nv12` holds JPEG's YCbCr instead (BT.601, full range: what JFIF decoders expect), made for
+    /// the JPEG Link, which then compresses it without touching BGRA. Video encoders must not use it.
+    pub nv12_jfif: bool,
     /// Set for a frame that lives only on the GPU (Windows capture handing over a shared texture):
     /// `data` is then empty, and only the GPU compositor can draw it. The engine asks for such
     /// frames only when it can, and otherwise reads the source's ordinary CPU frame.
@@ -37,7 +40,7 @@ pub struct SharedFrame {
 impl VideoFrame {
     pub fn new(width: u32, height: u32, data: Vec<u8>) -> Self {
         debug_assert_eq!(data.len(), (width * height * 4) as usize);
-        Self { width, height, data: Arc::new(data), nv12: None, gpu: None }
+        Self { width, height, data: Arc::new(data), nv12: None, nv12_jfif: false, gpu: None }
     }
 
     pub fn solid(width: u32, height: u32, bgra: [u8; 4]) -> Self {
@@ -50,7 +53,7 @@ impl VideoFrame {
 
     /// A frame that exists only as a shared GPU texture.
     pub fn from_gpu(width: u32, height: u32, shared: SharedFrame) -> Self {
-        Self { width, height, data: Arc::new(Vec::new()), nv12: None, gpu: Some(Arc::new(shared)) }
+        Self { width, height, data: Arc::new(Vec::new()), nv12: None, nv12_jfif: false, gpu: Some(Arc::new(shared)) }
     }
 
     pub fn byte_len(&self) -> usize {

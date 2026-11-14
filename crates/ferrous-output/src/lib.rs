@@ -4,6 +4,7 @@
 //! mixed 48 kHz float audio goes in over a loopback TCP socket, and FFmpeg
 //! scales, encodes and muxes to a file or a live ingest URL.
 
+pub mod es_mux;
 pub mod convert;
 mod stats;
 
@@ -194,12 +195,19 @@ fn tqs() -> &'static [&'static str] {
 
 /// Full FFmpeg argument list (without the program name).
 pub fn build_args(cfg: &OutputConfig, audio_ports: &[u16]) -> Vec<String> {
+    build_args_for(cfg, audio_ports, None)
+}
+
+/// [`build_args`]; with `encoded` (an FFmpeg input format: `h264`, `hevc` or `obu` for AV1), the
+/// video arrives already compressed by Ferrous's own GPU encoder and FFmpeg only muxes it
+/// (`-c:v copy`), the way OBS hands its encoder output to the muxer.
+pub fn build_args_for(cfg: &OutputConfig, audio_ports: &[u16], encoded: Option<&str>) -> Vec<String> {
     let v = &cfg.video;
     let mut a: Vec<String> = Vec::new();
     let mut push = |items: &[&str]| a.extend(items.iter().map(|s| s.to_string()));
 
     push(&["-hide_banner", "-loglevel", "warning", "-stats", "-stats_period", "1", "-nostdin", "-y"]);
-    let hw = args::hw_upload(&cfg.encoder.encoder);
+    let hw = if encoded.is_some() { None } else { args::hw_upload(&cfg.encoder.encoder) };
     if let Some((global, _)) = &hw {
         a.extend(global.iter().cloned());
     }
@@ -208,7 +216,12 @@ pub fn build_args(cfg: &OutputConfig, audio_ports: &[u16]) -> Vec<String> {
     // YUV at the output size.
     let fps = v.fps.to_string();
     let converted = effective_conversion(v, &cfg.encoder) == ConversionMode::Ferrous;
-    if converted {
+    if let Some(fmt) = encoded {
+        // The frames arrive wrapped in a small container that carries their exact timestamps
+        // (see `es_mux`); a bare stream has none, and newer FFmpeg then starves the audio input.
+        let container = es_mux::EsKind::from_format(fmt).map_or("mpegts", es_mux::EsKind::ffmpeg_format);
+        push(&[tqs(), &["-f", container, "-i", "pipe:0"]].concat());
+    } else if converted {
         let (w, h) = encoder_input_size(v);
         let size = format!("{w}x{h}");
         push(&[tqs(), &["-f", "rawvideo", "-pix_fmt", encoder_layout(&cfg.encoder).ffmpeg_pix_fmt()]].concat());
@@ -234,7 +247,9 @@ pub fn build_args(cfg: &OutputConfig, audio_ports: &[u16]) -> Vec<String> {
     }
 
     let upload = hw.as_ref().map(|(_, f)| *f);
-    if converted {
+    if encoded.is_some() {
+        push(&["-c:v", "copy"]);
+    } else if converted {
         if let Some(f) = upload {
             push(&["-vf", f]);
         }
@@ -253,8 +268,10 @@ pub fn build_args(cfg: &OutputConfig, audio_ports: &[u16]) -> Vec<String> {
         }
         push(&["-vf", &vf]);
     }
-    push(&["-fps_mode", "cfr"]);
-    a.extend(args::video_args(&cfg.encoder, v.fps));
+    if encoded.is_none() {
+        push(&["-fps_mode", "cfr"]);
+        a.extend(args::video_args(&cfg.encoder, v.fps));
+    }
 
     match &cfg.target {
         Target::File { path, format } => {
@@ -278,8 +295,12 @@ pub fn build_args(cfg: &OutputConfig, audio_ports: &[u16]) -> Vec<String> {
             a.extend(args::audio_args(AudioCodec::Aac, cfg.audio_bitrate_kbps));
             let mut push = |items: &[&str]| a.extend(items.iter().map(|s| s.to_string()));
             // Keyframe on every segment boundary so clips can start anywhere.
-            let kf = format!("expr:gte(t,n_forced*{segment_secs})");
-            push(&["-force_key_frames", &kf, "-max_muxing_queue_size", "4096"]);
+            // (A GPU-encoded stream already has a keyframe at every segment boundary.)
+            if encoded.is_none() {
+                let kf = format!("expr:gte(t,n_forced*{segment_secs})");
+                push(&["-force_key_frames", &kf]);
+            }
+            push(&["-max_muxing_queue_size", "4096"]);
             push(&["-f", "segment", "-segment_time", &segment_secs.to_string()]);
             push(&["-segment_wrap", &count.to_string(), "-reset_timestamps", "1", "-segment_format", "mpegts"]);
             a.push(dir.join("seg%03d.ts").to_string_lossy().into_owned());
@@ -306,9 +327,58 @@ const STOP_GRACE: Duration = Duration::from_secs(15);
 #[cfg(test)]
 const STOP_GRACE: Duration = Duration::from_millis(1500);
 
+/// What the output's video thread writes to FFmpeg.
+enum VideoIn {
+    Frame(VideoFrame),
+    /// Compressed video from Ferrous's own encoder.
+    Packet(EncodedFrame),
+}
+
+/// One compressed frame from Ferrous's own encoder, in decode order (see [`es_mux::EsMux::frame`]).
+pub struct EncodedFrame {
+    pub data: Vec<u8>,
+    pub pts: u64,
+    pub dts: i64,
+    pub keyframe: bool,
+}
+
+/// Hands compressed video to an output started with [`Output::start_encoded`]. Cheap to clone.
+#[derive(Clone)]
+pub struct PacketSink {
+    tx: Sender<VideoIn>,
+    stats: Arc<OutputStats>,
+    /// Set when the output is stopping: the sink then refuses packets, and the video thread ends
+    /// (closing FFmpeg's input) even though this sink still holds a sender.
+    closed: Arc<AtomicBool>,
+}
+
+impl PacketSink {
+    /// Queues one compressed frame. Blocks briefly if FFmpeg is behind (the encoder must not lose
+    /// packets: every later frame depends on the earlier ones). False once the output has stopped.
+    pub fn send(&self, packet: EncodedFrame) -> bool {
+        if self.closed.load(Ordering::Relaxed) {
+            return false;
+        }
+        match self.tx.send_timeout(VideoIn::Packet(packet), Duration::from_secs(2)) {
+            Ok(()) => true,
+            Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => {
+                self.stats.fail("FFmpeg stopped accepting video");
+                false
+            }
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => false,
+        }
+    }
+}
+
 /// A running output. Dropping it stops it cleanly.
 pub struct Output {
-    video_tx: Option<Sender<VideoFrame>>,
+    video_tx: Option<Sender<VideoIn>>,
+    /// Video comes as compressed packets (raw frames must never be mixed in).
+    encoded: bool,
+    /// See [`PacketSink`].
+    video_closed: Arc<AtomicBool>,
+    /// Takes the GPU compositor's NV12 as it is, so frames don't need their BGRA read back.
+    nv12_input: bool,
     owed_frames: Arc<AtomicU64>,
     pub stats: Arc<OutputStats>,
     child: Arc<Mutex<Child>>,
@@ -321,13 +391,26 @@ pub struct Output {
 impl Output {
     /// `audio` holds one receiver per entry in `cfg.tracks()`.
     pub fn start(cfg: OutputConfig, audio: Vec<Receiver<AudioChunk>>) -> anyhow::Result<Self> {
+        Self::start_with(cfg, audio, None)
+    }
+
+    /// An output whose video is compressed by Ferrous itself (`format`: `h264`, `hevc` or `obu`);
+    /// feed it through the returned sink. FFmpeg only muxes and sends.
+    pub fn start_encoded(cfg: OutputConfig, audio: Vec<Receiver<AudioChunk>>, format: &str) -> anyhow::Result<(Self, PacketSink)> {
+        let out = Self::start_with(cfg, audio, Some(format))?;
+        let tx = out.video_tx.clone().ok_or_else(|| anyhow::anyhow!("output has no video input"))?;
+        let sink = PacketSink { tx, stats: out.stats.clone(), closed: out.video_closed.clone() };
+        Ok((out, sink))
+    }
+
+    fn start_with(cfg: OutputConfig, audio: Vec<Receiver<AudioChunk>>, encoded: Option<&str>) -> anyhow::Result<Self> {
         let mut ports = Vec::new();
         for _ in 0..audio.len() {
             let l = TcpListener::bind("127.0.0.1:0")?;
             ports.push(l.local_addr()?.port());
         }
         probe_input_queue_option(&cfg.ffmpeg);
-        let argv = build_args(&cfg, &ports);
+        let argv = build_args_for(&cfg, &ports, encoded);
         log::info!("ffmpeg {}", redact(&argv).join(" "));
 
         let mut child = ffmpeg::command(&cfg.ffmpeg)
@@ -355,21 +438,57 @@ impl Output {
             )
         });
         // A few frames of buffer; more just adds latency and memory.
-        let (video_tx, video_rx) = crossbeam_channel::bounded::<VideoFrame>(8);
+        // (Compressed packets are small; give them more room so a muxer hiccup doesn't stall the encoder.)
+        let (video_tx, video_rx) = crossbeam_channel::bounded::<VideoIn>(if encoded.is_some() { 240 } else { 8 });
+        let mut es = encoded.and_then(es_mux::EsKind::from_format).map(|k| es_mux::EsMux::new(k, cfg.video.fps, encoder_input_size(&cfg.video)));
+        let mut es_buf = Vec::new();
+        let video_closed = Arc::new(AtomicBool::new(false));
+        let closed = video_closed.clone();
 
         let video_thread = {
             let (stats, owed) = (stats.clone(), owed.clone());
             thread::Builder::new().name("output-video".into()).spawn(move || {
                 let mut yuv = Vec::new();
                 let mut converted: Option<Arc<Vec<u8>>> = None;
-                while let Ok(frame) = video_rx.recv() {
-                    if frame.byte_len() != frame_bytes {
+                loop {
+                    // Ends when every sender is gone, or when the output is stopping and nothing is
+                    // queued (a GPU encoder's sink may still hold a sender at that point).
+                    let input = match video_rx.recv_timeout(Duration::from_millis(50)) {
+                        Ok(i) => i,
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            if closed.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    };
+                    let frame = match input {
+                        VideoIn::Packet(p) => {
+                            es_buf.clear();
+                            match es.as_mut() {
+                                Some(m) => m.frame(&p.data, p.pts, p.dts, p.keyframe, &mut es_buf),
+                                None => es_buf.extend_from_slice(&p.data),
+                            }
+                            if stdin.write_all(&es_buf).is_err() {
+                                stats.fail("FFmpeg stopped accepting video");
+                                break;
+                            }
+                            stats.frames_written.fetch_add(1, Ordering::Relaxed);
+                            stats.bytes_piped.fetch_add(p.data.len() as u64, Ordering::Relaxed);
+                            continue;
+                        }
+                        VideoIn::Frame(f) => f,
+                    };
+                    // The GPU's NV12 needs no BGRA (the compositor may not have read any back).
+                    let ready = converter.as_ref().and_then(|c| c.ready_made(&frame));
+                    if ready.is_none() && frame.byte_len() != frame_bytes {
                         log::error!("frame size mismatch: {frame:?}");
                         continue;
                     }
-                    let bytes: &[u8] = match &converter {
-                        Some(c) if c.ready_made(&frame).is_some() => c.ready_made(&frame).unwrap_or_default(),
-                        Some(c) => {
+                    let bytes: &[u8] = match (&converter, ready) {
+                        (_, Some(r)) => r,
+                        (Some(c), None) => {
                             // A static scene hands over the same buffer each
                             // tick; its YUV from last time is still valid.
                             if !converted.as_ref().is_some_and(|p| Arc::ptr_eq(p, &frame.data)) {
@@ -378,7 +497,7 @@ impl Output {
                             }
                             &yuv
                         }
-                        None => &frame.data,
+                        (None, None) => &frame.data,
                     };
                     if stdin.write_all(bytes).is_err() {
                         stats.fail("FFmpeg stopped accepting video");
@@ -406,7 +525,14 @@ impl Output {
             let (stop, stats) = (audio_stop.clone(), stats.clone());
             audio_threads.push(thread::Builder::new().name("output-audio".into()).spawn(move || {
                 let deadline = Instant::now() + Duration::from_secs(15);
+                // FFmpeg opens this input only after it has read the start of the video, which can take
+                // seconds. Keep the audio from that wait (instead of letting the mixer drop it) so the
+                // sound starts with the first picture rather than seconds ahead of it.
+                let mut early: Vec<AudioChunk> = Vec::new();
                 let mut sock = loop {
+                    while let Ok(chunk) = rx.try_recv() {
+                        early.push(chunk);
+                    }
                     match TcpStream::connect(("127.0.0.1", port)) {
                         Ok(s) => break s,
                         Err(_) if Instant::now() < deadline && !stop.load(Ordering::Relaxed) => {
@@ -422,6 +548,15 @@ impl Output {
                 };
                 let _ = sock.set_nodelay(true);
                 let mut bytes = Vec::with_capacity(480 * 2 * 4);
+                for chunk in early.drain(..) {
+                    bytes.clear();
+                    for s in chunk.iter() {
+                        bytes.extend_from_slice(&s.to_le_bytes());
+                    }
+                    if sock.write_all(&bytes).is_err() {
+                        return;
+                    }
+                }
                 while !stop.load(Ordering::Relaxed) {
                     let Ok(chunk) = rx.recv_timeout(Duration::from_millis(100)) else { continue };
                     bytes.clear();
@@ -463,6 +598,9 @@ impl Output {
 
         Ok(Self {
             video_tx: Some(video_tx),
+            encoded: encoded.is_some(),
+            nv12_input: encoded.is_none() && effective_conversion(&cfg.video, &cfg.encoder) == ConversionMode::Ferrous && gpu_nv12_applies(&cfg.video, &cfg.encoder),
+            video_closed,
             owed_frames: owed,
             stats,
             child,
@@ -475,8 +613,11 @@ impl Output {
 
     /// Hands a composed frame to the encoder without blocking the render loop.
     pub fn push_frame(&self, frame: &VideoFrame) {
+        if self.encoded {
+            return;
+        }
         let Some(tx) = &self.video_tx else { return };
-        match tx.try_send(frame.clone()) {
+        match tx.try_send(VideoIn::Frame(frame.clone())) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 self.stats.frames_skipped.fetch_add(1, Ordering::Relaxed);
@@ -505,6 +646,22 @@ impl Output {
         }
     }
 
+    /// True when the video arrives already compressed (Ferrous's own GPU encoder).
+    pub fn encoded(&self) -> bool {
+        self.encoded
+    }
+
+    /// Whether frames must carry BGRA pixels: not for a GPU-encoded output, nor for one that takes
+    /// the GPU compositor's NV12 as it is.
+    pub fn needs_bgra(&self) -> bool {
+        !self.encoded && !self.nv12_input
+    }
+
+    /// Whether this output reads the GPU compositor's (video) NV12.
+    pub fn takes_nv12(&self) -> bool {
+        self.nv12_input
+    }
+
     pub fn pid(&self) -> u32 {
         self.child.lock().id()
     }
@@ -521,6 +678,7 @@ impl Output {
 
     fn shutdown(&mut self) -> anyhow::Result<()> {
         self.video_tx.take();
+        self.video_closed.store(true, Ordering::Relaxed);
         self.audio_stop.store(true, Ordering::Relaxed);
         let deadline = Instant::now() + STOP_GRACE;
         // The writer threads can be stuck in a pipe write if FFmpeg has stopped reading (a stalled
@@ -637,6 +795,15 @@ mod tests {
         assert_eq!(stream_muxer("rtmps://a.rtmps.youtube.com:443/live2/x"), "flv");
         assert_eq!(stream_muxer("srt://x:1"), "mpegts");
         assert_eq!(stream_muxer("https://whip.example/endpoint"), "whip");
+    }
+
+    #[test]
+    fn encoded_input_is_copied_not_reencoded() {
+        let c = cfg("h264_nvenc", ConversionMode::Ferrous);
+        let j = build_args_for(&c, &[5000], Some("h264")).join(" ");
+        assert!(j.contains("-f mpegts -i pipe:0"), "{j}");
+        assert!(j.contains("-c:v copy"), "{j}");
+        assert!(!j.contains("-c:v h264_nvenc") && !j.contains("-vf") && !j.contains("-fps_mode"), "{j}");
     }
 
     fn cfg(encoder: &str, conversion: ConversionMode) -> OutputConfig {

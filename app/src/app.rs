@@ -127,6 +127,8 @@ pub struct FerrousApp {
     last_scene_save: Instant,
     ui_rate: Option<(Instant, u64)>,
     last_ui_frame: Option<Instant>,
+    /// The restored window size has been checked (a tiny saved size is replaced, once).
+    window_checked: bool,
     selected: Option<u64>,
     preview_tex: Option<TextureHandle>,
     preview_serial: u64,
@@ -231,6 +233,7 @@ impl FerrousApp {
             last_scene_save: Instant::now(),
             ui_rate: None,
             last_ui_frame: None,
+            window_checked: false,
             selected: None,
             preview_tex: None,
             preview_serial: 0,
@@ -496,6 +499,29 @@ impl FerrousApp {
     }
 
     /// Writes how fast the window is being redrawn to the log every 15 s (a diagnostic for GPU use).
+    /// The window's size and position are restored from the last run. If that was saved while the
+    /// window was minimised or squeezed (a remote-desktop session can do it), Ferrous came back as a
+    /// 64x64 window in the corner every time: replace any size below the minimum with the default,
+    /// centred on the monitor.
+    fn fix_tiny_window(&mut self, ctx: &egui::Context) {
+        if self.window_checked {
+            return;
+        }
+        let (inner, monitor, minimized) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().monitor_size, i.viewport().minimized));
+        let Some(r) = inner else { return };
+        self.window_checked = true;
+        if minimized == Some(true) || (r.width() >= 960.0 && r.height() >= 600.0) {
+            return;
+        }
+        let size = egui::vec2(1440.0, 860.0);
+        log::info!("window restored at {:.0}x{:.0}; resetting it to {:.0}x{:.0}", r.width(), r.height(), size.x, size.y);
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        if let Some(m) = monitor {
+            let pos = ((m - size) / 2.0).max(egui::Vec2::ZERO);
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos.to_pos2()));
+        }
+    }
+
     fn log_ui_rate(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         let passes = ctx.cumulative_pass_nr();
@@ -3570,6 +3596,7 @@ impl eframe::App for FerrousApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.fix_tiny_window(ui.ctx());
         // The window redraws at most `max_fps` times a second, however many things ask for a repaint
         // (preview frames, meters, input): on a 240 Hz display it otherwise drew ~190 frames a second.
         if self.settings.ui.max_fps > 0 {

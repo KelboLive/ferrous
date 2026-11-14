@@ -16,6 +16,7 @@ use rayon::prelude::*;
 
 pub use ferrous_core::frame::FramePool;
 pub use gpu::{prefer_dx12, GpuCompositor};
+pub use ferrous_nvenc;
 
 pub struct Composed {
     pub frame: VideoFrame,
@@ -41,6 +42,10 @@ pub struct Renderer {
     pipelined: bool,
     /// Have the GPU also produce the NV12 picture for encoders.
     nv12: bool,
+    /// See [`Renderer::set_bgra`].
+    bgra: bool,
+    /// See [`Renderer::set_nv12_jfif`].
+    nv12_jfif: bool,
     /// Inputs of the frame in flight on the GPU, so its result can be
     /// memoised under the right key when it arrives.
     in_flight: Option<Inputs>,
@@ -72,7 +77,7 @@ impl Renderer {
     /// `prefer_gpu = false` forces the CPU path.
     pub fn new(width: u32, height: u32, prefer_gpu: bool) -> (Self, Option<String>) {
         let (backend, err) = Self::backend(width, height, prefer_gpu);
-        (Self { backend, memo: Memo::default(), pool: FramePool::default(), pipelined: false, nv12: false, in_flight: None }, err)
+        (Self { backend, memo: Memo::default(), pool: FramePool::default(), pipelined: false, nv12: false, bgra: true, nv12_jfif: false, in_flight: None }, err)
     }
 
     fn backend(width: u32, height: u32, prefer_gpu: bool) -> (Backend, Option<String>) {
@@ -100,6 +105,40 @@ impl Renderer {
 
     /// True when frames that live only in a shared GPU texture can be drawn: the GPU compositor on
     /// the same adapter as the capture. Turns false for good if opening one fails.
+    /// Marks the next composition as the program picture for output frame `pts` (GPU encoders copy it).
+    pub fn set_encode_pts(&mut self, pts: Option<u64>) {
+        if let Backend::Gpu(g) = &mut self.backend {
+            g.set_encode_pts(pts);
+        }
+    }
+
+    /// Starts an in-process hardware encoder fed straight from the canvas texture (see
+    /// [`GpuCompositor::add_encoder`]).
+    pub fn add_gpu_encoder(&mut self, config: ferrous_nvenc::Config, sink: ferrous_nvenc::Sink) -> anyhow::Result<std::sync::Arc<ferrous_nvenc::Stats>> {
+        let r = match &mut self.backend {
+            Backend::Gpu(g) => g.add_encoder(config, sink),
+            Backend::Cpu(_) => anyhow::bail!("the CPU compositor can't feed a GPU encoder"),
+        };
+        // A memoised (static) scene would never be drawn again, so the new encoder would never get
+        // its first picture and FFmpeg would wait for video forever: draw the next frame for real.
+        self.memo.entries.clear();
+        r
+    }
+
+    /// Once per output frame, after the program picture (see [`GpuCompositor::encoders_tick`]).
+    pub fn encoders_tick(&mut self, pts: u64) {
+        if let Backend::Gpu(g) = &mut self.backend {
+            g.encoders_tick(pts);
+        }
+    }
+
+    pub fn gpu_encoder_count(&self) -> usize {
+        match &self.backend {
+            Backend::Gpu(g) => g.encoder_count(),
+            Backend::Cpu(_) => 0,
+        }
+    }
+
     pub fn takes_gpu_frames(&self) -> bool {
         matches!(&self.backend, Backend::Gpu(g) if g.shared_ok())
     }
@@ -125,12 +164,28 @@ impl Renderer {
         self.nv12 = on;
     }
 
+    /// Whether the GPU path copies the picture back as BGRA (default on). Turn it off for frames
+    /// where nothing on the CPU looks at the picture (no preview due, no virtual camera, outputs on
+    /// NV12 or the GPU encoders): the returned frame then has empty `data`. No effect on the CPU path.
+    pub fn set_bgra(&mut self, on: bool) {
+        self.bgra = on;
+    }
+
+    /// Make the GPU's NV12 in JPEG's YCbCr (BT.601 full range) for the JPEG Link, instead of video's
+    /// (BT.709 limited); frames say which in `nv12_jfif`. No effect on the CPU path.
+    pub fn set_nv12_jfif(&mut self, on: bool) {
+        self.nv12_jfif = on;
+    }
+
     /// Composes and reports per-layer cost: measured CPU milliseconds on the
     /// CPU path; on the GPU path, the pass's measured GPU time split across
     /// layers by covered area (an estimate, flagged as such). A memo hit
     /// reports zero cost, because nothing was drawn.
     pub fn compose_timed(&mut self, layers: &[Layer<'_>]) -> Composed {
-        if let Some(frame) = self.memo.get(false, layers) {
+        // A memoised frame only counts if it has what this frame needs.
+        let gpu = matches!(self.backend, Backend::Gpu(_));
+        let (need_bgra, need_nv12) = (self.bgra || !gpu, self.nv12 && gpu);
+        if let Some(frame) = self.memo.get(false, layers).filter(|f| (!need_bgra || !f.data.is_empty()) && (!need_nv12 || (f.nv12.is_some() && f.nv12_jfif == self.nv12_jfif))) {
             return Composed { frame, cpu_ms: vec![0.0; layers.len()], gpu_ms: Vec::new(), gpu_total_ms: None };
         }
         let out = match &mut self.backend {
@@ -143,7 +198,9 @@ impl Renderer {
             Backend::Gpu(g) => {
                 let t = std::time::Instant::now();
                 let (w, h) = g.size();
-                let (buf, _) = self.pool.take((w * h * 4) as usize);
+                g.set_want_bgra(self.bgra);
+                g.set_nv12_jfif(self.nv12_jfif);
+                let (buf, _) = if self.bgra { self.pool.take((w * h * 4) as usize) } else { (Vec::new(), false) };
                 let frame = if self.pipelined {
                     let (frame, is_current) = g.compose_pipelined(layers, buf, self.nv12);
                     // The frame that came back belongs to the inputs it was
@@ -703,6 +760,52 @@ mod tests {
         // Back to synchronous: exact and immediate.
         r.set_pipelined(false);
         assert_eq!(&r.compose(&l(&a)).data[..4], &[255, 0, 0, 255]);
+    }
+
+    /// Without the BGRA read-back the frame carries only NV12, and a memoised frame without BGRA is
+    /// never handed out when BGRA is wanted again.
+    #[test]
+    fn gpu_skips_the_bgra_readback_when_asked() {
+        std::env::set_var("FERROUS_FORCE_GPU", "1");
+        let (mut r, err) = Renderer::new(32, 32, true);
+        if err.is_some() || !matches!(r.backend, Backend::Gpu(_)) {
+            eprintln!("no GPU; skipping");
+            return;
+        }
+        let a = VideoFrame::solid(32, 32, [255, 0, 0, 255]);
+        let l = [Layer { frame: &a, transform: Transform::default(), filters: &[] }];
+        r.set_nv12(true);
+        r.set_bgra(false);
+        let f = r.compose(&l);
+        assert!(f.data.is_empty(), "no BGRA");
+        let nv12 = f.nv12.as_ref().expect("NV12 still produced");
+        assert_eq!(nv12.len(), 32 * 32 * 3 / 2);
+        // Same layers, BGRA wanted again: must not come back empty from the memo.
+        r.set_bgra(true);
+        let g = r.compose(&l);
+        assert_eq!(&g.data[..4], &[255, 0, 0, 255]);
+        // JPEG's YCbCr: the test colour (BGRA 255,0,0 = pure blue) is Y 29, Cb 255, Cr 107 in JFIF,
+        // not video's 32/240/118.
+        r.set_nv12_jfif(true);
+        r.set_bgra(false);
+        let j = r.compose(&l);
+        let nv = j.nv12.as_ref().expect("JFIF planes");
+        assert!(j.nv12_jfif);
+        let (y, cb, cr) = (nv[0], nv[32 * 32], nv[32 * 32 + 1]);
+        assert!((i32::from(y) - 29).abs() <= 2 && (i32::from(cb) - 255).abs() <= 2 && (i32::from(cr) - 107).abs() <= 2, "{y} {cb} {cr}");
+        r.set_nv12_jfif(false);
+        let v = r.compose(&l);
+        assert!(!v.nv12_jfif, "a video consumer never gets JPEG's YCbCr from the memo");
+        r.set_bgra(true);
+        // Pipelined, alternating (a preview every other frame): every BGRA frame is real.
+        r.set_pipelined(true);
+        for i in 0..6 {
+            r.set_bgra(i % 2 == 0);
+            let f = r.compose(&l);
+            if !f.data.is_empty() {
+                assert_eq!(&f.data[..4], &[255, 0, 0, 255]);
+            }
+        }
     }
 
     use super::*;

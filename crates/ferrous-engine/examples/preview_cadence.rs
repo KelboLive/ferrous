@@ -12,7 +12,7 @@ fn main() {
     let secs: u64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(6);
     let fps: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(60);
     let mut settings = Settings::default();
-    settings.video = VideoSettings { base_width: 1920, base_height: 1080, output_width: 1920, output_height: 1080, fps, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false };
+    settings.video = VideoSettings { base_width: 1920, base_height: 1080, output_width: 1920, output_height: 1080, fps, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false, zero_copy_encoding: false };
     settings.audio.desktop_enabled = false;
     settings.audio.mic_enabled = false;
     let mut scenes = SceneCollection::default();

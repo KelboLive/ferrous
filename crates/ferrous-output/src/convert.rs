@@ -208,7 +208,8 @@ impl Converter {
     /// compositor already made it: NV12 at the frame's own size, which is
     /// the output size (nothing to scale).
     pub fn ready_made<'a>(&self, frame: &'a ferrous_core::VideoFrame) -> Option<&'a [u8]> {
-        let nv12 = frame.nv12.as_ref()?;
+        // (JPEG's YCbCr, made for the JPEG Link, is not video's.)
+        let nv12 = frame.nv12.as_ref().filter(|_| !frame.nv12_jfif)?;
         (self.layout == YuvLayout::Nv12 && self.src == self.dst && (frame.width, frame.height) == self.src && nv12.len() == self.output_bytes())
             .then_some(nv12.as_slice())
     }

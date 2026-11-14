@@ -280,6 +280,8 @@ struct Shared {
     multiview: AtomicBool,
     multiview_thumbs: Mutex<Vec<Option<Arc<PreviewFrame>>>>,
     stop: AtomicBool,
+    /// Outputs waiting for the render thread to start their GPU encoder (it owns the compositor).
+    encoder_requests: Mutex<Vec<EncoderRequest>>,
     events: Sender<EngineEvent>,
 }
 
@@ -293,6 +295,128 @@ pub struct Engine {
 
 const MAX_RECONNECTS: u32 = 10;
 const REPLAY_SEGMENT_SECS: u32 = 2;
+
+/// A GPU encoder for the render thread to start on its compositor.
+struct EncoderRequest {
+    config: ferrous_render::ferrous_nvenc::Config,
+    sink: ferrous_render::ferrous_nvenc::Sink,
+    reply: Sender<Result<(), String>>,
+}
+
+/// Where the GPU encoder's packets go before and after the FFmpeg muxer is up.
+enum SinkState {
+    /// Muxer not started yet: keep packets (the first is the keyframe everything depends on).
+    Waiting(Vec<ferrous_output::EncodedFrame>),
+    Ready(ferrous_output::PacketSink),
+    Cancelled,
+}
+
+/// The zero-copy (in-process NVENC) settings for an output, if it can use that path: an NVIDIA
+/// encoder, the setting on, the GPU renderer, no HDR and no custom FFmpeg encoder options.
+fn zero_copy_config(cfg: &OutputConfig) -> Option<(ferrous_render::ferrous_nvenc::Config, &'static str)> {
+    use ferrous_render::ferrous_nvenc::{Codec, Config, Rate};
+    let v = &cfg.video;
+    let e = &cfg.encoder;
+    if !v.zero_copy_encoding || v.renderer == ferrous_core::RendererMode::Cpu || ferrous_encode::args::hdr_active(e) || !e.custom_args.trim().is_empty() {
+        return None;
+    }
+    let (codec, format) = match e.encoder.as_str() {
+        "h264_nvenc" => (Codec::H264, "h264"),
+        "hevc_nvenc" => (Codec::Hevc, "hevc"),
+        "av1_nvenc" => (Codec::Av1, "obu"),
+        _ => return None,
+    };
+    let fps = v.fps.max(1);
+    let q = e.quality.clamp(1, 51) as u8;
+    let rate = match e.rate_control {
+        ferrous_core::RateControl::Cbr => Rate::Cbr(e.bitrate_kbps.max(100)),
+        ferrous_core::RateControl::Vbr => Rate::Vbr(e.bitrate_kbps.max(100)),
+        ferrous_core::RateControl::Quality => Rate::Quality(q),
+        ferrous_core::RateControl::Cqp => Rate::Cqp(q),
+    };
+    let mut keyint = e.keyframe_interval_secs.max(1);
+    // The replay buffer cuts on segment boundaries, so it needs a keyframe at every one.
+    if let Target::Replay { segment_secs, .. } = &cfg.target {
+        keyint = keyint.min((*segment_secs).max(1));
+    }
+    let preset = e.preset.strip_prefix('p').and_then(|p| p.parse::<u8>().ok()).filter(|p| (1..=7).contains(p)).unwrap_or(5);
+    // Look-ahead spends latency for quality: recordings yes, live streams no.
+    let live = matches!(cfg.target, Target::Stream { .. });
+    let config = Config {
+        codec,
+        input: (v.base_width, v.base_height),
+        output: ferrous_output::encoder_input_size(v),
+        fps,
+        rate,
+        preset,
+        keyframe_interval_frames: keyint * fps,
+        lookahead: !live && matches!(rate, Rate::Quality(_) | Rate::Vbr(_)),
+        multipass: true,
+        bframes: e.b_frames.min(4),
+    };
+    Some((config, format))
+}
+
+/// Starts an output, encoding on the GPU inside Ferrous when it can (see [`zero_copy_config`]) and
+/// through FFmpeg otherwise; any failure on the GPU path falls back to FFmpeg.
+fn start_output(shared: &Shared, audio: &AudioEngine, cfg: OutputConfig) -> anyhow::Result<Output> {
+    if let Some((config, format)) = zero_copy_config(&cfg) {
+        match start_zero_copy(shared, audio, &cfg, config, format) {
+            Ok(out) => return Ok(out),
+            Err(e) => log::warn!("GPU encoder not used ({e}); encoding through FFmpeg"),
+        }
+    }
+    Output::start(cfg.clone(), subscribe_all(audio, &cfg))
+}
+
+fn start_zero_copy(shared: &Shared, audio: &AudioEngine, cfg: &OutputConfig, config: ferrous_render::ferrous_nvenc::Config, format: &str) -> anyhow::Result<Output> {
+    let state = Arc::new(Mutex::new(SinkState::Waiting(Vec::new())));
+    let sink: ferrous_render::ferrous_nvenc::Sink = {
+        let state = state.clone();
+        Box::new(move |p: ferrous_render::ferrous_nvenc::Packet<'_>| {
+            let owned = || ferrous_output::EncodedFrame { data: p.data.to_vec(), pts: p.pts, dts: p.dts, keyframe: p.keyframe };
+            let mut st = state.lock();
+            match &mut *st {
+                SinkState::Waiting(early) => {
+                    early.push(owned());
+                    // A muxer that never comes: give up after ~10 s of video.
+                    early.len() < 600
+                }
+                SinkState::Ready(out) => out.send(owned()),
+                SinkState::Cancelled => false,
+            }
+        })
+    };
+    let (reply, rx) = crossbeam_channel::bounded(1);
+    shared.encoder_requests.lock().push(EncoderRequest { config, sink, reply });
+    match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => anyhow::bail!(e),
+        Err(_) => {
+            *state.lock() = SinkState::Cancelled;
+            anyhow::bail!("the render thread didn't start it in time")
+        }
+    }
+    match Output::start_encoded(cfg.clone(), subscribe_all(audio, cfg), format) {
+        Ok((out, packets)) => {
+            let mut st = state.lock();
+            if let SinkState::Waiting(early) = std::mem::replace(&mut *st, SinkState::Cancelled) {
+                for p in early {
+                    if !packets.send(p) {
+                        break;
+                    }
+                }
+            }
+            *st = SinkState::Ready(packets);
+            log::info!("{}: encoding on the GPU inside Ferrous (zero copy)", cfg.encoder.encoder);
+            Ok(out)
+        }
+        Err(e) => {
+            *state.lock() = SinkState::Cancelled;
+            Err(e)
+        }
+    }
+}
 
 fn subscribe_all(audio: &AudioEngine, cfg: &OutputConfig) -> Vec<crossbeam_channel::Receiver<ferrous_output::AudioChunk>> {
     cfg.tracks().into_iter().map(|t| audio.subscribe_track(t)).collect()
@@ -335,6 +459,7 @@ impl Engine {
             multiview: AtomicBool::new(false),
             multiview_thumbs: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
+            encoder_requests: Mutex::new(Vec::new()),
             events: tx,
         });
         let audio = Arc::new(AudioEngine::start(&settings.audio));
@@ -526,7 +651,7 @@ impl Engine {
             audio_bitrate_kbps: s.record.audio_bitrate_kbps,
             audio_tracks: ferrous_output::tracks_from_mask(s.record.audio_tracks),
         };
-        let out = Output::start(cfg.clone(), subscribe_all(&self.audio, &cfg))?;
+        let out = start_output(&self.shared, &self.audio, cfg)?;
         let mut o = self.shared.outputs.lock();
         o.record = Some(out);
         o.record_path = Some(path.clone());
@@ -600,7 +725,8 @@ impl Engine {
                 audio_bitrate_kbps: d.audio_bitrate_kbps,
                 audio_tracks: vec![d.audio_track],
             };
-            match Output::start(cfg.clone(), subscribe_all(&self.audio, &cfg)) {
+            let started = if vertical { Output::start(cfg.clone(), subscribe_all(&self.audio, &cfg)) } else { start_output(&self.shared, &self.audio, cfg.clone()) };
+            match started {
                 Ok(out) => extras.push(ExtraStream { name: d.name.clone(), vertical, cfg, output: Some(out), attempts: 0, retry_at: None }),
                 Err(e) => errors.push(format!("{}: {e}", d.name)),
             }
@@ -623,7 +749,7 @@ impl Engine {
             audio_bitrate_kbps: s.stream.audio_bitrate_kbps,
             audio_tracks: vec![s.stream.audio_track],
         };
-        let out = Output::start(cfg.clone(), subscribe_all(&self.audio, &cfg))?;
+        let out = start_output(&self.shared, &self.audio, cfg.clone())?;
         let mut o = self.shared.outputs.lock();
         o.stream = Some(out);
         o.stream_retry = None;
@@ -695,7 +821,7 @@ impl Engine {
             audio_bitrate_kbps: s.record.audio_bitrate_kbps,
             audio_tracks: ferrous_output::tracks_from_mask(s.record.audio_tracks),
         };
-        let out = Output::start(cfg.clone(), subscribe_all(&self.audio, &cfg))?;
+        let out = start_output(&self.shared, &self.audio, cfg.clone())?;
         self.shared.outputs.lock().replay = Some((out, dir.clone()));
         if let (true, Some((vw, vh))) = (s.replay.vertical_too, s.video.vertical) {
             let vdir = dir.with_extension("vertical");
@@ -1092,6 +1218,12 @@ fn render_loop(shared: Arc<Shared>, audio: Arc<AudioEngine>, video: ferrous_core
         last_start = Some(t0);
         let mut laps = Laps::new();
         frame_no += 1;
+        // GPU encoders for outputs that just started (the compositor lives on this thread).
+        let requests = std::mem::take(&mut *shared.encoder_requests.lock());
+        for r in requests {
+            let res = compositor.add_gpu_encoder(r.config, r.sink).map(|_| ()).map_err(|e| format!("{e:#}"));
+            let _ = r.reply.send(res);
+        }
         let pcfg = *shared.preview_cfg.lock();
         let divisor = if pcfg.max_fps == 0 { 1 } else { u64::from(fps.div_ceil(pcfg.max_fps.max(1))) };
         let preview_due = pcfg.enabled && frame_no.is_multiple_of(divisor);
@@ -1144,14 +1276,56 @@ fn render_loop(shared: Arc<Shared>, audio: Arc<AudioEngine>, video: ferrous_core
         // The GPU's NV12 conversion (and its extra readback) only pays off when
         // something will encode this picture: skip it for a plain preview.
         if on_gpu {
-            let wanted = {
+            // What the program picture has to come back as, this frame:
+            // - video NV12 (BT.709) for outputs that take the GPU's NV12, and Hardware links fed
+            //   frames at canvas size;
+            // - JPEG's YCbCr for JPEG links at canvas size, when nothing needs video NV12 (the GPU
+            //   converts once, as OBS does for obs-teleport; with both wanted, the JPEG link uses BGRA);
+            // - BGRA (4 bytes a pixel, the GPU path's biggest per-frame cost) only when something on
+            //   the CPU looks at the picture itself.
+            let canvas_size = |l: &ActiveLink| l.cfg.width == 0 || l.cfg.height == 0 || ((l.cfg.width & !1), (l.cfg.height & !1)) == (video.base_width, video.base_height);
+            let (outputs_nv12, outputs_bgra) = {
                 let o = shared.outputs.lock();
-                o.record.is_some() || o.stream.is_some() || o.replay.is_some() || o.extras.iter().any(|e| e.output.is_some() && !e.vertical)
-            } || shared.links.lock().iter().any(|l| matches!(l.cfg.codec, ferrous_core::LinkCodec::Hardware { .. }) && matches!(l.cfg.target, ferrous_core::LinkSourceTarget::Program));
-            compositor.set_nv12(wanted);
+                let all: Vec<&Output> = o.record.iter().chain(o.stream.iter()).chain(o.replay.iter().map(|(x, _)| x)).chain(o.extras.iter().filter(|e| !e.vertical).filter_map(|e| e.output.as_ref())).collect();
+                (all.iter().any(|x| x.takes_nv12()), o.vcam.is_some() || all.iter().any(|x| x.needs_bgra()))
+            };
+            let (links_nv12, jpeg_yuv_links, links_bgra) = {
+                let ls = shared.links.lock();
+                let program = |l: &&ActiveLink| matches!(l.cfg.target, ferrous_core::LinkSourceTarget::Program);
+                let hw_frames = |l: &&ActiveLink| matches!(l.cfg.codec, ferrous_core::LinkCodec::Hardware { .. }) && l.sender.stream_input().is_none();
+                let jpeg_420 = |l: &&ActiveLink| matches!(l.cfg.codec, ferrous_core::LinkCodec::Jpeg { full_chroma: false, .. }) && canvas_size(l);
+                (
+                    ls.iter().filter(program).any(|l| hw_frames(&l) && canvas_size(l)),
+                    ls.iter().filter(program).any(|l| jpeg_420(&l)),
+                    ls.iter().filter(program).any(|l| !(matches!(l.cfg.codec, ferrous_core::LinkCodec::Hardware { .. }) && (l.sender.stream_input().is_some() || canvas_size(l))) && !jpeg_420(&l))
+                        || ls.iter().filter(program).any(|l| hw_frames(&l) && !canvas_size(l)),
+                )
+            };
+            let video_nv12 = outputs_nv12 || links_nv12;
+            let jfif = jpeg_yuv_links && !video_nv12;
+            compositor.set_nv12(video_nv12 || jfif);
+            compositor.set_nv12_jfif(jfif);
+            // With pipelined read-back the frame returned now was drawn last time, so a preview due
+            // next frame counts too.
+            let preview_soon = pcfg.enabled && (preview_due || (pipelined_readback && (frame_no + 1).is_multiple_of(divisor)));
+            let jpeg_needs_bgra = jpeg_yuv_links && !jfif;
+            compositor.set_bgra(preview_soon || outputs_bgra || links_bgra || jpeg_needs_bgra || transition.is_some() || shared.studio_scene.lock().is_some());
         }
         compositor.set_pipelined(pipelined_readback && transition.is_none() && shared.studio_scene.lock().is_none() && !shared.links.lock().iter().any(|l| matches!(l.cfg.target, ferrous_core::LinkSourceTarget::Scene { .. })));
+        // GPU encoders copy the program picture as it is composed; during a transition the blend is
+        // made on the CPU, so they get that instead (below).
+        let in_transition = transition.is_some();
+        let encoding = compositor.gpu_encoder_count() > 0;
+        if encoding && !in_transition {
+            compositor.set_encode_pts(Some(frame_no));
+        }
         let to = compose_nested(&scenes.scenes[program], Some(&scenes), &mut cache, &mut compositor, 0);
+        compositor.set_encode_pts(None);
+        // Everything composed after the program picture (studio preview, multiview, scenes for links)
+        // is read back as plain BGRA.
+        compositor.set_bgra(true);
+        compositor.set_nv12(false);
+        compositor.set_nv12_jfif(false);
         compositor.set_pipelined(false);
         let canvas = match &mut transition {
             Some(t) => {
@@ -1196,6 +1370,14 @@ fn render_loop(shared: Arc<Shared>, audio: Arc<AudioEngine>, video: ferrous_core
             }
             None => to,
         };
+        if encoding && in_transition {
+            compositor.set_encode_pts(Some(frame_no));
+            let _ = compositor.compose(&[Layer { frame: &canvas, transform: Default::default(), filters: &[] }]);
+            compositor.set_encode_pts(None);
+        }
+        if encoding {
+            compositor.encoders_tick(frame_no);
+        }
 
         laps.lap(0);
         // Vertical canvas: same program scene, its own layout.
@@ -1283,7 +1465,7 @@ fn render_loop(shared: Arc<Shared>, audio: Arc<AudioEngine>, video: ferrous_core
 
         laps.lap(3);
         // Program preview: every rendered frame unless capped.
-        if preview_due && !same_buffer(&preview_src, &canvas) {
+        if preview_due && !canvas.data.is_empty() && !same_buffer(&preview_src, &canvas) {
             preview_src = Some(canvas.data.clone());
             serial += 1;
             previews.submit(PreviewKind::Program, &canvas, pcfg.width, serial);
@@ -1415,12 +1597,12 @@ impl Drop for ActiveLink {
 
 /// Starts/stops Ferrous Link outputs to match the settings.
 fn sync_links(shared: &Shared, audio: &AudioEngine, settings: &Settings) {
-    let mut links = shared.links.lock();
+    let old: Vec<ActiveLink> = std::mem::take(&mut *shared.links.lock());
+    let mut links: Vec<ActiveLink> = Vec::new();
     // Shut the old senders down completely before starting new ones, so a restarted link gets its own
     // port back. Each link's audio thread holds a reference to its sender and lets go within ~100 ms of
     // being told to stop; starting the new sender before that found the port still taken and moved to
     // the next one, so receivers had to be pointed at a new port after every settings change.
-    let old: Vec<ActiveLink> = links.drain(..).collect();
     let deadline = Instant::now() + Duration::from_millis(500);
     for l in old {
         let sender = l.sender.clone();
@@ -1430,6 +1612,8 @@ fn sync_links(shared: &Shared, audio: &AudioEngine, settings: &Settings) {
         }
         drop(sender); // the last reference: closes the listener and records the port as just released
     }
+    // (The new links are built without holding the lock: starting a GPU encoder waits for the render
+    // thread, which takes that lock every frame.)
     let v = &settings.video;
     for cfg in settings.links.iter().filter(|l| l.enabled) {
         let fps = if cfg.fps == 0 { v.fps } else { cfg.fps.min(v.fps) };
@@ -1444,8 +1628,9 @@ fn sync_links(shared: &Shared, audio: &AudioEngine, settings: &Settings) {
             pin: cfg.pin.clone(),
             audio: cfg.audio,
             ffmpeg: ferrous_encode::ffmpeg::locate(&settings.ffmpeg_path),
+            external_stream: false,
         };
-        match ferrous_link::LinkSender::start(sc) {
+        match start_link_sender(shared, sc, cfg, settings) {
             Ok(sender) => {
                 let sender = Arc::new(sender);
                 let audio_stop = Arc::new(AtomicBool::new(false));
@@ -1474,6 +1659,71 @@ fn sync_links(shared: &Shared, audio: &AudioEngine, settings: &Settings) {
             }
         }
     }
+    *shared.links.lock() = links;
+}
+
+/// Starts a link's sender. A Hardware link of the program picture with an NVIDIA encoder is fed by an
+/// in-process GPU encoder straight from the canvas (no read-back, no FFmpeg on this PC), the way
+/// recording is; anything else, or any failure starting that, uses the FFmpeg encoder.
+fn start_link_sender(shared: &Shared, mut sc: ferrous_link::sender::SenderConfig, cfg: &ferrous_core::LinkOutputSettings, settings: &Settings) -> anyhow::Result<ferrous_link::LinkSender> {
+    use ferrous_render::ferrous_nvenc::{Codec, Config, Rate};
+    let v = &settings.video;
+    let gpu = match &cfg.codec {
+        ferrous_core::LinkCodec::Hardware { encoder, bitrate_kbps }
+            if v.zero_copy_encoding && v.renderer != ferrous_core::RendererMode::Cpu && matches!(cfg.target, ferrous_core::LinkSourceTarget::Program) && sc.fps == v.fps =>
+        {
+            let codec = match encoder.as_str() {
+                "h264_nvenc" => Some(Codec::H264),
+                "hevc_nvenc" => Some(Codec::Hevc),
+                _ => None,
+            };
+            codec.map(|codec| Config {
+                codec,
+                input: (v.base_width, v.base_height),
+                output: (sc.width & !1, sc.height & !1),
+                fps: sc.fps.max(1),
+                // Variable bitrate around the target; no look-ahead, no B-frames: each frame leaves as
+                // soon as it is encoded.
+                rate: Rate::Vbr((*bitrate_kbps).max(1000)),
+                preset: 4,
+                keyframe_interval_frames: sc.fps.max(1),
+                lookahead: false,
+                multipass: false,
+                bframes: 0,
+            })
+        }
+        _ => None,
+    };
+    if let Some(config) = gpu {
+        sc.external_stream = true;
+        let sender = ferrous_link::LinkSender::start(sc.clone())?;
+        let input = sender.stream_input().expect("external stream requested");
+        let kind = if config.codec == Codec::Hevc { ferrous_output::es_mux::EsKind::Hevc } else { ferrous_output::es_mux::EsKind::H264 };
+        let mut mux = ferrous_output::es_mux::EsMux::new(kind, config.fps, config.output);
+        let sink: ferrous_render::ferrous_nvenc::Sink = Box::new(move |p| {
+            let mut buf = Vec::with_capacity(p.data.len() + p.data.len() / 180 * 8 + 1024);
+            mux.frame(p.data, p.pts, p.dts, p.keyframe, &mut buf);
+            match input.send_timeout(buf, Duration::from_millis(500)) {
+                Ok(()) => true,
+                Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => true, // a stalled receiver; it rejoins at a keyframe
+                Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => false,
+            }
+        });
+        let (reply, rx) = crossbeam_channel::bounded(1);
+        shared.encoder_requests.lock().push(EncoderRequest { config, sink, reply });
+        match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(Ok(())) => {
+                log::info!("Ferrous Link \"{}\": encoding on the GPU inside Ferrous (zero copy)", cfg.name);
+                return Ok(sender);
+            }
+            Ok(Err(e)) => log::warn!("Ferrous Link \"{}\": GPU encoder not used ({e}); using FFmpeg", cfg.name),
+            Err(_) => log::warn!("Ferrous Link \"{}\": GPU encoder didn't start in time; using FFmpeg", cfg.name),
+        }
+        // Free the port before starting again on the FFmpeg path.
+        drop(sender);
+        sc.external_stream = false;
+    }
+    ferrous_link::LinkSender::start(sc)
 }
 
 struct ActiveTransition {

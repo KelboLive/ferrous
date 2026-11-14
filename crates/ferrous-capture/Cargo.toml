@@ -23,5 +23,5 @@ base64.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-capture.workspace = true
-windows.workspace = true
+windows = { workspace = true, features = ["Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc", "Win32_Devices_Display"] }
 wasapi.workspace = true

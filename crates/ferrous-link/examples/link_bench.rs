@@ -76,6 +76,7 @@ fn main() {
         pin: pin.clone(),
         audio: false,
         ffmpeg: ffmpeg.clone(),
+        external_stream: false,
     })
     .unwrap();
     let rx = LinkReceiver::start(&format!("127.0.0.1:{}", sender.port), &pin, ffmpeg, None);

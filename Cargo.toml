@@ -4,6 +4,7 @@ members = [
     "crates/ferrous-core",
     "crates/ferrous-encode",
     "crates/ferrous-render",
+    "crates/ferrous-nvenc",
     "crates/ferrous-capture",
     "crates/ferrous-audio",
     "crates/ferrous-output",

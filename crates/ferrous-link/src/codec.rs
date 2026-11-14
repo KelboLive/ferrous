@@ -80,6 +80,8 @@ pub fn scale(frame: &VideoFrame, w: u32, h: u32) -> VideoFrame {
 pub struct JpegEncoder {
     c: turbojpeg::Compressor,
     quality: u8,
+    /// Scratch for planar YCbCr (reused).
+    planar: Vec<u8>,
 }
 
 impl JpegEncoder {
@@ -92,7 +94,7 @@ impl JpegEncoder {
         let mut c = turbojpeg::Compressor::new()?;
         c.set_subsamp(if full_chroma { turbojpeg::Subsamp::None } else { turbojpeg::Subsamp::Sub2x2 })?;
         c.set_quality(90)?;
-        Ok(Self { c, quality: 90 })
+        Ok(Self { c, quality: 90, planar: Vec::new() })
     }
 
     /// Payload: header, then the JPEG.
@@ -111,6 +113,33 @@ impl JpegEncoder {
         };
         let jpeg = self.c.compress_to_vec(image)?;
         let mut v = header(ts, frame.width, frame.height);
+        v.extend_from_slice(&jpeg);
+        Ok(v)
+    }
+}
+
+impl JpegEncoder {
+    /// Compresses JPEG-ready YCbCr (BT.601 full range, NV12 layout: a Y plane, then Cb/Cr pairs at
+    /// half size) without any colour conversion: the planes are only split into the planar form
+    /// libjpeg-turbo takes. 4:2:0, like obs-teleport.
+    pub fn encode_jfif_nv12(&mut self, w: u32, h: u32, nv12: &[u8], quality: u8, ts: u64) -> anyhow::Result<Vec<u8>> {
+        let (wu, hu) = (w as usize, h as usize);
+        anyhow::ensure!(w.is_multiple_of(2) && h.is_multiple_of(2) && nv12.len() >= wu * hu * 3 / 2, "bad YCbCr frame");
+        let q = quality.clamp(10, 100);
+        if q != self.quality {
+            self.c.set_quality(i32::from(q))?;
+            self.quality = q;
+        }
+        let (luma, chroma) = nv12.split_at(wu * hu);
+        let quarter = wu * hu / 4;
+        self.planar.clear();
+        self.planar.reserve(wu * hu * 3 / 2);
+        self.planar.extend_from_slice(luma);
+        self.planar.extend(chroma[..quarter * 2].iter().step_by(2));
+        self.planar.extend(chroma[..quarter * 2].iter().skip(1).step_by(2));
+        let image = turbojpeg::YuvImage { pixels: self.planar.as_slice(), width: wu, align: 1, height: hu, subsamp: turbojpeg::Subsamp::Sub2x2 };
+        let jpeg = self.c.compress_yuv_to_vec(image)?;
+        let mut v = header(ts, w, h);
         v.extend_from_slice(&jpeg);
         Ok(v)
     }
@@ -283,6 +312,23 @@ impl LosslessDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// JPEG straight from JFIF YCbCr decodes to the colour it describes.
+    #[test]
+    fn jpeg_from_ycbcr_planes_decodes_to_the_right_colour() {
+        let (w, h) = (64u32, 32u32);
+        // Pure blue in JFIF: Y 29, Cb 255, Cr 107.
+        let mut nv12 = vec![29u8; (w * h) as usize];
+        for _ in 0..(w * h / 4) {
+            nv12.extend_from_slice(&[255, 107]);
+        }
+        let mut enc = JpegEncoder::new().unwrap();
+        let payload = enc.encode_jfif_nv12(w, h, &nv12, 95, 0).unwrap();
+        let mut dec = JpegDecoder::new().unwrap();
+        let f = dec.decode(&payload[16..], w, h).unwrap();
+        let px = &f.data[(16 * w as usize + 30) * 4..][..4];
+        assert!(px[0] > 240 && px[1] < 15 && px[2] < 15, "BGRA {px:?}");
+    }
 
     fn pattern(w: u32, h: u32, shift: u32) -> VideoFrame {
         let mut d = vec![0u8; (w * h * 4) as usize];

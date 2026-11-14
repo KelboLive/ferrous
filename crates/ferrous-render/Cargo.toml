@@ -16,6 +16,7 @@ pollster.workspace = true
 bytemuck.workspace = true
 log.workspace = true
 anyhow.workspace = true
+ferrous-nvenc = { path = "../ferrous-nvenc" }
 image.workspace = true
 
 [target.'cfg(windows)'.dependencies]

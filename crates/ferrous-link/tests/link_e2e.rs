@@ -11,7 +11,7 @@ use ferrous_link::{LinkReceiver, LinkSender};
 use parking_lot::Mutex;
 
 fn cfg(name: &str, codec: LinkCodec, pin: &str) -> SenderConfig {
-    SenderConfig { name: name.into(), codec, width: 320, height: 180, fps: 30, port: 0, pin: pin.into(), audio: true, ffmpeg: PathBuf::from("ffmpeg") }
+    SenderConfig { name: name.into(), codec, width: 320, height: 180, fps: 30, port: 0, pin: pin.into(), audio: true, ffmpeg: PathBuf::from("ffmpeg"), external_stream: false }
 }
 
 fn frame(t: u8) -> VideoFrame {

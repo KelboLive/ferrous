@@ -1,0 +1,16 @@
+[package]
+name = "ferrous-nvenc"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+description = "In-process NVIDIA NVENC encoding from GPU textures (no raw frames through a pipe)"
+
+[dependencies]
+libloading = "0.8"
+log.workspace = true
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Graphics_Direct3D"] }

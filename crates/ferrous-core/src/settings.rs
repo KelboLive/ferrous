@@ -192,6 +192,10 @@ pub struct VideoSettings {
     /// copy by itself when it can't.
     #[serde(default)]
     pub gpu_capture: bool,
+    /// NVIDIA encoders run inside Ferrous, fed straight from the canvas on the GPU (as in OBS);
+    /// FFmpeg only writes the file or sends the stream. Falls back by itself when unavailable.
+    #[serde(default = "yes")]
+    pub zero_copy_encoding: bool,
 }
 
 fn yes() -> bool {
@@ -224,7 +228,7 @@ impl Default for VideoSettings {
             vertical: None,
             conversion: ConversionMode::Auto,
             pipelined_readback: true,
-            gpu_priority: true, gpu_capture: false,
+            gpu_priority: true, gpu_capture: false, zero_copy_encoding: true,
         }
     }
 }

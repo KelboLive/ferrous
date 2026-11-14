@@ -30,7 +30,7 @@ fn record_with(format: RecordingFormat, encoder: &str, renderer: RendererMode) -
     let dir = std::env::temp_dir().join(format!("ferrous-e2e-{encoder}-{}-{renderer:?}", format.extension()));
     let _ = std::fs::remove_dir_all(&dir);
     let mut settings = Settings::default();
-    settings.video = VideoSettings { base_width: 640, base_height: 360, output_width: 320, output_height: 180, fps: 30, renderer, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false };
+    settings.video = VideoSettings { base_width: 640, base_height: 360, output_width: 320, output_height: 180, fps: 30, renderer, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false, zero_copy_encoding: false };
     settings.audio.desktop_enabled = false;
     settings.audio.mic_enabled = false;
     settings.record.folder = dir.clone();
@@ -127,7 +127,7 @@ fn media_source_video_and_audio_reach_recording() {
     assert!(ok);
 
     let mut settings = Settings::default();
-    settings.video = VideoSettings { base_width: 640, base_height: 360, output_width: 640, output_height: 360, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false };
+    settings.video = VideoSettings { base_width: 640, base_height: 360, output_width: 640, output_height: 360, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false, zero_copy_encoding: false };
     settings.audio.desktop_enabled = false;
     settings.audio.mic_enabled = false;
     settings.record.folder = dir.clone();
@@ -179,7 +179,7 @@ fn media_source_video_and_audio_reach_recording() {
 fn chroma_key_filter_applies_in_engine() {
     use ferrous_core::filters::{Filter, VideoFilter};
     let mut settings = Settings::default();
-    settings.video = VideoSettings { base_width: 64, base_height: 64, output_width: 64, output_height: 64, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false };
+    settings.video = VideoSettings { base_width: 64, base_height: 64, output_width: 64, output_height: 64, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false, zero_copy_encoding: false };
     settings.audio.desktop_enabled = false;
     settings.audio.mic_enabled = false;
     let mut scenes = SceneCollection::default();
@@ -204,7 +204,7 @@ fn chroma_key_filter_applies_in_engine() {
 #[test]
 fn fade_transition_and_studio_preview() {
     let mut settings = Settings::default();
-    settings.video = VideoSettings { base_width: 32, base_height: 32, output_width: 32, output_height: 32, fps: 60, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false };
+    settings.video = VideoSettings { base_width: 32, base_height: 32, output_width: 32, output_height: 32, fps: 60, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false, zero_copy_encoding: false };
     settings.audio.desktop_enabled = false;
     settings.audio.mic_enabled = false;
     let mut scenes = SceneCollection::default();
@@ -245,7 +245,7 @@ fn stinger_transition_overlays_video() {
         .unwrap()
         .success());
     let mut settings = Settings::default();
-    settings.video = VideoSettings { base_width: 64, base_height: 64, output_width: 64, output_height: 64, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false };
+    settings.video = VideoSettings { base_width: 64, base_height: 64, output_width: 64, output_height: 64, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false, zero_copy_encoding: false };
     settings.audio.desktop_enabled = false;
     settings.audio.mic_enabled = false;
     let mut scenes = SceneCollection::default();
@@ -301,7 +301,7 @@ fn mean_volume(path: &std::path::Path, stream: &str) -> f32 {
 
 fn small_settings(dir: &std::path::Path) -> Settings {
     let mut settings = Settings::default();
-    settings.video = VideoSettings { base_width: 64, base_height: 64, output_width: 64, output_height: 64, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false };
+    settings.video = VideoSettings { base_width: 64, base_height: 64, output_width: 64, output_height: 64, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false, zero_copy_encoding: false };
     settings.audio.desktop_enabled = false;
     settings.audio.mic_enabled = false;
     settings.record.folder = dir.to_path_buf();
@@ -391,7 +391,7 @@ fn replay_buffer_saves_clip() {
 #[test]
 fn nested_scene_source() {
     let mut settings = Settings::default();
-    settings.video = VideoSettings { base_width: 100, base_height: 100, output_width: 100, output_height: 100, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false };
+    settings.video = VideoSettings { base_width: 100, base_height: 100, output_width: 100, output_height: 100, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false, zero_copy_encoding: false };
     settings.audio.desktop_enabled = false;
     settings.audio.mic_enabled = false;
     let mut scenes = SceneCollection::default();
@@ -417,7 +417,7 @@ fn nested_scene_source() {
 #[test]
 fn text_source_renders() {
     let mut settings = Settings::default();
-    settings.video = VideoSettings { base_width: 320, base_height: 120, output_width: 320, output_height: 120, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false };
+    settings.video = VideoSettings { base_width: 320, base_height: 120, output_width: 320, output_height: 120, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false, zero_copy_encoding: false };
     settings.audio.desktop_enabled = false;
     settings.audio.mic_enabled = false;
     let mut scenes = SceneCollection::default();
@@ -444,7 +444,7 @@ fn text_source_renders() {
 fn ferrous_link_between_two_engines() {
     let mk = |w: u32| {
         let mut s = Settings::default();
-        s.video = VideoSettings { base_width: w, base_height: w / 2, output_width: w, output_height: w / 2, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false };
+        s.video = VideoSettings { base_width: w, base_height: w / 2, output_width: w, output_height: w / 2, fps: 30, renderer: RendererMode::Cpu, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false, zero_copy_encoding: false };
         s.audio.desktop_enabled = false;
         s.audio.mic_enabled = false;
         s
@@ -483,6 +483,57 @@ fn ferrous_link_between_two_engines() {
     assert_eq!(stats.clients.load(std::sync::atomic::Ordering::Relaxed), 1);
 }
 
+/// The Teleport way: A composes on the GPU, converts to JPEG's YCbCr there and sends JPEGs made
+/// straight from those planes (no BGRA read-back, A's preview off); B must show A's colour.
+#[test]
+fn jpeg_link_from_gpu_ycbcr() {
+    std::env::set_var("FERROUS_FORCE_GPU", "1");
+    let mk = |renderer| {
+        let mut s = Settings::default();
+        s.video = VideoSettings { base_width: 128, base_height: 64, output_width: 128, output_height: 64, fps: 30, renderer, vertical: None, conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false, zero_copy_encoding: false };
+        s.audio.desktop_enabled = false;
+        s.audio.mic_enabled = false;
+        s
+    };
+    let mut a_settings = mk(RendererMode::Auto);
+    a_settings.links = vec![ferrous_core::LinkOutputSettings {
+        enabled: true,
+        name: "GPU JPEG".into(),
+        codec: ferrous_core::LinkCodec::Jpeg { quality: 95, adaptive: false, full_chroma: false },
+        port: 47911,
+        pin: "1357".into(),
+        ..Default::default()
+    }];
+    let mut a_scenes = SceneCollection::default();
+    a_scenes.scenes[0].items.clear();
+    a_scenes.add_item("Teal", SourceConfig::Color { bgra: [180, 140, 20, 255], width: 128, height: 64 });
+    let a = Engine::start(a_settings, a_scenes);
+    a.set_preview_config(ferrous_engine::PreviewConfig { enabled: false, ..Default::default() });
+    let mut b_scenes = SceneCollection::default();
+    b_scenes.scenes[0].items.clear();
+    let id = b_scenes.add_item("From A", SourceConfig::LinkReceiver { sender: "127.0.0.1:47911".into(), pin: "1357".into() });
+    let b = Engine::start(mk(RendererMode::Cpu), b_scenes);
+    let mut last = None;
+    for _ in 0..80 {
+        std::thread::sleep(Duration::from_millis(100));
+        if let Some(p) = b.preview() {
+            let px = [p.rgba[0], p.rgba[1], p.rgba[2]];
+            last = Some(px);
+            // RGBA preview of BGRA (180,140,20): R 20, G 140, B 180, within JPEG's rounding.
+            if (i32::from(px[0]) - 20).abs() <= 10 && (i32::from(px[1]) - 140).abs() <= 10 && (i32::from(px[2]) - 180).abs() <= 10 {
+                let (_, _, stats) = &a.link_stats()[0];
+                let yuv = stats.frames_from_gpu_yuv.load(std::sync::atomic::Ordering::Relaxed);
+                if std::env::var_os("FERROUS_FORCE_GPU").is_some() && yuv == 0 {
+                    eprintln!("note: no GPU here, so the JPEGs came from BGRA");
+                }
+                eprintln!("JPEGs from GPU YCbCr: {yuv}");
+                return;
+            }
+        }
+    }
+    panic!("B never showed A's colour; last {last:?}, source info {:?}", b.source_info(id));
+}
+
 /// TikTok-style: a vertical canvas streamed to a destination whose key is
 /// given per session, while the main canvas stays horizontal. A local FFmpeg
 /// RTMP listener plays the platform.
@@ -503,7 +554,7 @@ fn vertical_destination_with_session_key() {
     std::thread::sleep(Duration::from_millis(800));
 
     let mut settings = Settings::default();
-    settings.video = VideoSettings { base_width: 640, base_height: 360, output_width: 640, output_height: 360, fps: 30, renderer: RendererMode::Cpu, vertical: Some((360, 640)), conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false };
+    settings.video = VideoSettings { base_width: 640, base_height: 360, output_width: 640, output_height: 360, fps: 30, renderer: RendererMode::Cpu, vertical: Some((360, 640)), conversion: Default::default(), pipelined_readback: true, gpu_priority: false, gpu_capture: false, zero_copy_encoding: false };
     settings.audio.desktop_enabled = false;
     settings.audio.mic_enabled = false;
     settings.stream.server = String::new(); // only the destination

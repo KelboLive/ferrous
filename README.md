@@ -15,9 +15,11 @@ through plugins for things people use every day. Ferrous has one aim: **capture,
 record and stream with as little overhead as possible, and still give you the cleanest, smoothest picture
 your hardware can produce.** In practice that means:
 
-- **Low resource use first.** A multi-threaded GPU compositor (filters included) with a CPU fallback,
-  finished NV12 handed straight to the encoder, optional GPU-resident capture, memoised static scenes, a
-  capped window redraw rate, and no work done for windows or previews you aren't looking at. Every feature is judged against its cost.
+- **Low resource use first.** A GPU compositor (filters included) with a CPU fallback; on NVIDIA, encoding
+  inside Ferrous straight from the GPU (as OBS does), with FFmpeg only writing the file or sending the stream;
+  only the read-back each frame actually needs; GPU capture; HDR tone-mapping on the GPU; memoised static
+  scenes; a capped window redraw rate; and no work done for windows or previews you aren't looking at.
+  Every feature is judged against its cost.
 - **Picture quality you can measure.** Every encoder is tuned (two-pass, lookahead, adaptive
   quantisation, 10-bit internals), HDR10 output is built in, and a built-in benchmark compares
   settings by speed *and* quality (SSIM/VMAF) so you pick settings from evidence, not guesses.
@@ -27,16 +29,20 @@ your hardware can produce.** In practice that means:
 - **Familiar, not foreign.** obs-websocket 5 compatible (Stream Deck, Touch Portal and Streamer.bot work),
   OBS scene-collection import, and an OBS-style Add Source dialog.
 
-> **Status: v0.4, pre-release.** Built and tested on Linux with a Windows cross-build; much of the Windows-only
-> code (virtual camera, game capture, VST3 editors, the D3D12/Vulkan encoders, HDR playback) has not yet been
-> run on real hardware. Progress, test evidence and deferred items are in [`docs/PROGRESS.md`](docs/PROGRESS.md).
+> **Status: v0.4, pre-release.** Built and tested on Linux with a Windows cross-build, and now run on a
+> Windows PC (RTX 4070 Ti SUPER): the GPU compositor, game capture, GPU capture, zero-copy NVENC recording and
+> Ferrous Link between two PCs work there. Still untested on real hardware: the virtual camera, VST3 editors,
+> the D3D12/Vulkan Video encoders and HDR playback. Progress, test evidence and deferred items are in [`docs/PROGRESS.md`](docs/PROGRESS.md).
 
 ## Highlights
 
 | | |
 |---|---|
 | **Filters on the GPU** | Chroma key, colour correction, scroll, LUTs and the background-removal mask run as GPU passes in the compositor (shaders compile the first time you use a filter). CPU twins stay as the fallback and are tested to give the same picture. |
-| **GPU-resident capture (experimental)** | Settings → Video → *GPU capture*: display, window and game capture hand each frame to the renderer as a shared texture and skip the copy through system memory. Off by default; it falls back to the normal path by itself for plugin filters, background removal, nested scenes, a different GPU or any error. |
+| **Zero-copy NVIDIA encoding** | Recording, streaming, the replay buffer and Hardware Links of the program picture encode with NVENC inside Ferrous, straight from the canvas texture on the GPU: no picture copied to system memory, no raw frames through a pipe. FFmpeg only muxes and sends. Your rate control, preset, keyframes and B-frames carry over. Settings → Video → *Zero-copy encoding* (on); anything else falls back to the FFmpeg path by itself. |
+| **Only the read-back each frame needs** | The GPU path copies the picture back to the CPU only in the form something will use that frame: NV12 for encoders that take it, JPEG's YCbCr for the JPEG Link, nothing for GPU-encoded outputs, and full BGRA only when the preview is due, a transition runs or the virtual camera is on. |
+| **GPU capture** | Settings → Video → *GPU capture*: display, window and game capture hand each frame to the renderer as a shared texture and skip the copy through system memory. Falls back to the normal path by itself for plugin filters, background removal, nested scenes, a different GPU or any error; the log says when it is in use. |
+| **HDR displays** | On a display in HDR, captures are taken in 16-bit and tone-mapped on the GPU, with Windows' SDR content brightness as white: highlights roll off instead of clipping to flat white. |
 | **Sharper downscaling** | Layers shrunk by more than about 1.25:1 (a 4K display on a 1080p canvas) are area-averaged, so fine lines and text stop shimmering. 1:1 and enlarged layers cost nothing extra. |
 | **A GPU figure you can trust** | The Performance Monitor reads the card's own utilisation (the same counter RTSS shows) instead of Windows' per-engine counters, which can read far too high. |
 | **Window frame rate** | Settings → General: cap Ferrous's own window at 30/60/120/144/240 fps or unlimited, so it doesn't compete with your game for the GPU. Your video's frame rate is unaffected. |
@@ -60,7 +66,7 @@ your hardware can produce.** In practice that means:
 | **Encoders** | NVENC, AMF, Quick Sync (H.264/HEVC/AV1), **DirectX 12 Video and Vulkan Video** (H.264/HEVC/AV1 on any GPU whose driver supports them), Media Foundation, x264, x265, SVT-AV1, AOM. Every encoder is test-encoded before it's offered. The canvas can be converted to the encoder's YUV format in Ferrous, multi-threaded, before it reaches FFmpeg (62% less data per frame) |
 | **Outputs** | Recording (MKV, MP4, fragmented MP4, MOV, TS, FLV; multitrack; separate recording resolution), streaming (RTMP/RTMPS, SRT, WHIP) with auto-reconnect, **multistream destinations**, **replay buffer** (plus a vertical clip), **virtual camera** (Windows 11) |
 | **TikTok** | TikTok LIVE preset, per-session key prompt, vertical canvas output, vertical replay clips |
-| **Ferrous Link** | obs-teleport successor: LAN discovery on every network adapter, JPEG, lossless+alpha or hardware codecs, adaptive quality, PIN with encryption, live stats |
+| **Ferrous Link** | obs-teleport successor: LAN discovery on every network adapter; JPEG made the obs-teleport way (the GPU converts to YCbCr, the Link compresses the planes on every core, optional full colour detail), lossless+alpha, or a hardware codec (NVENC inside Ferrous from the GPU, evenly paced on the receiver); adaptive quality, PIN with encryption, a port that stays put across setting changes, live stats |
 | **Control** | **Undo/redo** (Ctrl+Z), per-scene transitions, program projector and multiview windows, Global hotkeys, **obs-websocket 5 compatible** API (Stream Deck, Touch Portal, Streamer.bot, TikFinity) |
 | **Extensibility** | Native C-ABI plugin system (`docs/PLUGINS.md`); **OBS plugin bridge** for OBS plugin sources (`docs/OBS_PLUGIN_BRIDGE.md`); VST3 |
 | **Presets** | **Recording presets** (built-in and your own) and a **speed/quality benchmark** that ranks settings for your PC |
@@ -93,7 +99,8 @@ crates/
   ferrous-render       GPU (wgpu) and CPU compositors, video filters, transitions
   ferrous-audio        WASAPI capture, mixer (6 tracks), audio filters, monitoring
   ferrous-encode       encoder catalog, hardware probe, FFmpeg args, auto-config
-  ferrous-output       FFmpeg outputs: record, stream, replay segments, multitrack
+  ferrous-output       FFmpeg outputs: record, stream, replay segments, multitrack; MPEG-TS/IVF for GPU-encoded video
+  ferrous-nvenc        in-process NVENC fed from the compositor's texture (D3D12 -> D3D11 video processor -> NVENC)
   ferrous-engine       render clock, source cache, outputs, destinations, links, perf accounting
   ferrous-link         Ferrous Link sender/receiver, codecs, discovery, encryption
   ferrous-remote       obs-websocket 5 protocol server
@@ -110,8 +117,11 @@ plugins/example      example plugin (gradient source, invert filter, gain filter
 plugins/vst3-test-gain  tiny VST3 effect used to test the VST3 host
 ```
 
-Encoding goes through FFmpeg, the same way OBS uses libavcodec for most of its outputs, which gives
-one stable interface to every hardware and software encoder.
+On NVIDIA, the program picture is encoded inside Ferrous straight from the GPU, as OBS does: the canvas is
+copied GPU to GPU into textures shared with a Direct3D 11 device, the GPU's video processor converts it to
+NV12 (BT.709), NVENC encodes it, and FFmpeg only muxes the compressed stream. Every other encoder goes
+through FFmpeg, the same way OBS uses libavcodec for most of its outputs, which gives one stable interface
+to every hardware and software encoder.
 
 ## Building
 
@@ -146,11 +156,12 @@ The previous to-do list is done (see "README to-do list" in `docs/PROGRESS.md`).
 - **Run the Windows-only parts on real hardware.** The virtual camera source, VST3 editor windows,
   the D3D12/Vulkan encoders and the OBS host on `obs.dll` all compile for Windows, but haven't run
   on a Windows machine yet.
-- **Optional: zero-copy encoding** (the canvas texture straight to the hardware encoder without a trip
-  through system memory). It would need an in-process encoder (Media Foundation) instead of FFmpeg's pipe.
-  It only matters for 4K60 and very high frame rates; at 1080p/1440p the FFmpeg route is just as fast and
-  keeps every tuned encoder option (NVENC multipass, lookahead, AV1, 10-bit HDR10), so it is not planned
-  unless those resolutions become a target.
+- **Measure against OBS on real hardware** (same game, same Link or recording) and close what remains.
+  The biggest known gap is the preview: Ferrous copies the picture to the CPU and uploads it again for its
+  window, where OBS draws its preview on the GPU. Sharing one GPU device between the compositor and the
+  window would remove that.
+- **Zero-copy encoding for AMD (AMF) and Intel (Quick Sync)**, the same way as NVENC; those cards use the
+  FFmpeg path until then.
 - **OBS plugin filters** through the bridge (sources work today).
 
 ## License
