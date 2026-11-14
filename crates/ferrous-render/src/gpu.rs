@@ -131,6 +131,24 @@ impl GpuCompositor {
         self.nv12_jfif = on;
     }
 
+    /// Draw a preview-sized RGBA copy at most this wide (keeping the aspect) with the next
+    /// compositions, read back instead of the full picture for the UI. `None` stops it.
+    pub fn set_preview_width(&mut self, width: Option<u32>) {
+        self.preview_width = width;
+    }
+
+    /// The preview copy that came back with the last collected frame, if any.
+    pub fn take_preview(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        self.last_preview.take()
+    }
+
+    fn preview_size(&self) -> Option<(u32, u32)> {
+        let pw = self.preview_width?.clamp(16, self.width.max(16));
+        let pw = pw.min(self.width);
+        let ph = ((u64::from(self.height) * u64::from(pw)) / u64::from(self.width.max(1))).max(1) as u32;
+        Some((pw, ph))
+    }
+
     /// Whether compositions copy the picture back as BGRA (see the field). Default on.
     pub fn set_want_bgra(&mut self, on: bool) {
         self.want_bgra = on;
@@ -303,6 +321,9 @@ pub struct GpuCompositor {
     cache: HashMap<usize, CachedTexture>,
     /// Shared textures opened so far, by ring slot id; dropped when unused for a while.
     shared: HashMap<u64, SharedTex>,
+    /// Capture fences opened so far, by fence id, with the frame count they were last waited on.
+    #[cfg(windows)]
+    fences: HashMap<u64, (windows::Win32::Graphics::Direct3D12::ID3D12Fence, u64)>,
     /// Shared frames drawn by the last two compositions: their ring slots stay off limits to the
     /// capture until the GPU is done reading them.
     held: [Vec<Arc<ferrous_core::SharedFrame>>; 2],
@@ -330,6 +351,12 @@ pub struct GpuCompositor {
     want_bgra: bool,
     /// Make the NV12 in JPEG's YCbCr (for the JPEG Link) instead of video's.
     nv12_jfif: bool,
+    /// Also draw a preview-sized RGBA copy of this width and read only that back (see
+    /// `set_preview_width`); the UI preview then needs no full-size BGRA and no CPU downscale.
+    preview_width: Option<u32>,
+    preview_pass: Option<PreviewPass>,
+    /// The preview copy of the frame most recently collected.
+    last_preview: Option<(u32, u32, Vec<u8>)>,
 }
 
 impl GpuCompositor {
@@ -499,6 +526,8 @@ impl GpuCompositor {
                 has_nv12: false,
                 nv12_jfif: false,
                 has_bgra: false,
+                preview: None,
+                has_preview: false,
                 sub: None,
             })
             .collect();
@@ -528,6 +557,8 @@ impl GpuCompositor {
             height,
             cache: HashMap::new(),
             shared: HashMap::new(),
+            #[cfg(windows)]
+            fences: HashMap::new(),
             held: [Vec::new(), Vec::new()],
             frames: 0,
             shared_ok: cfg!(windows) && adapter_is_dx12,
@@ -542,6 +573,9 @@ impl GpuCompositor {
             encode_pts: None,
             want_bgra: true,
             nv12_jfif: false,
+            preview_width: None,
+            preview_pass: None,
+            last_preview: None,
         })
     }
 
@@ -625,6 +659,46 @@ impl GpuCompositor {
         }
     }
 
+    /// Makes the next submission wait on the GPU until the capture's copy into the texture is done
+    /// (the capture signals the fence after it), so neither side waits on the CPU.
+    #[cfg(windows)]
+    fn wait_for_capture(&mut self, f: ferrous_core::SharedFence) {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::Graphics::Direct3D12::ID3D12Fence;
+        let frames = self.frames;
+        if !self.fences.contains_key(&f.id) {
+            // SAFETY: the handle came from `CreateSharedHandle` on a fence and stays open while the
+            // frame's guard lives (the frame is held by the caller).
+            let opened = unsafe {
+                self.device.as_hal::<wgpu::hal::api::Dx12>().and_then(|hal| {
+                    let mut fence: Option<ID3D12Fence> = None;
+                    hal.raw_device().OpenSharedHandle(HANDLE(f.handle as *mut _), &mut fence).ok()?;
+                    fence
+                })
+            };
+            match opened {
+                Some(fence) => {
+                    self.fences.insert(f.id, (fence, frames));
+                }
+                None => {
+                    // Without the wait a frame could be drawn before its copy lands: CPU frames from now on.
+                    log::warn!("GPU capture: couldn't open the capture's fence; using CPU frames");
+                    self.shared_ok = false;
+                    return;
+                }
+            }
+        }
+        let Some((fence, used)) = self.fences.get_mut(&f.id) else { return };
+        *used = frames;
+        // SAFETY: staging a wait on wgpu's own D3D12 queue for its next submit, which is the one that
+        // draws this frame.
+        unsafe {
+            if let Some(q) = self.queue.as_hal::<wgpu::hal::api::Dx12>() {
+                q.add_wait_fence(fence.clone(), f.value);
+            }
+        }
+    }
+
     #[cfg(not(windows))]
     fn open_shared(&self, _shared: &ferrous_core::SharedFrame, _dims: (u32, u32)) -> Option<SharedTex> {
         None
@@ -661,6 +735,10 @@ impl GpuCompositor {
             }
             if let Some(t) = self.shared.get_mut(&shared.id) {
                 t.last_used = self.frames;
+            }
+            #[cfg(windows)]
+            if let Some(f) = shared.fence {
+                self.wait_for_capture(f);
             }
             self.held[0].push(shared.clone());
             return SHARED_KEY + shared.id as usize;
@@ -755,6 +833,8 @@ impl GpuCompositor {
         self.held[0].clear();
         let frames = self.frames;
         self.shared.retain(|_, t| frames - t.last_used < 240);
+        #[cfg(windows)]
+        self.fences.retain(|_, (_, used)| frames - *used < 240);
         let keys: Vec<usize> = layers.iter().map(|l| self.texture_for(l.frame)).collect();
         // Frames no longer on screen: their textures go to the spare list.
         let gone: Vec<usize> = self.cache.keys().filter(|k| !keys.contains(k)).copied().collect();
@@ -932,7 +1012,21 @@ impl GpuCompositor {
                 n.encode(&mut enc, yb, uvb, w, h);
             }
         }
-        if let (Some((qs, resolve, _)), Some(ts)) = (&self.timing, &s.ts) {
+        let preview = self.preview_size();
+        if let Some((pw, ph)) = preview {
+            if self.preview_pass.as_ref().is_none_or(|p| (p.w, p.h) != (pw, ph)) {
+                self.preview_pass = Some(PreviewPass::new(&self.device, &self.target, pw, ph));
+            }
+            let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let row = (pw * 4).div_ceil(align) * align;
+            let s = &mut self.slots[slot];
+            if s.preview.as_ref().is_none_or(|(_, bw, bh, _)| (*bw, *bh) != (pw, ph)) {
+                s.preview = Some((map_buffer(&self.device, "preview", u64::from(row) * u64::from(ph)), pw, ph, row));
+            }
+            let (buf, ..) = s.preview.as_ref().expect("made above");
+            self.preview_pass.as_ref().expect("made above").encode(&mut enc, buf, row);
+        }
+        if let (Some((qs, resolve, _)), Some(ts)) = (&self.timing, &self.slots[slot].ts) {
             enc.resolve_query_set(qs, 0..2, resolve, 0);
             enc.copy_buffer_to_buffer(resolve, 0, ts, 0, 16);
         }
@@ -957,6 +1051,11 @@ impl GpuCompositor {
         if bgra {
             map(&s.bgra);
         }
+        if preview.is_some() {
+            if let Some((b, ..)) = &s.preview {
+                map(b);
+            }
+        }
         if let Some(ts) = &s.ts {
             map(ts);
         }
@@ -970,6 +1069,7 @@ impl GpuCompositor {
         s.has_nv12 = nv12;
         s.nv12_jfif = nv12 && self.nv12.as_ref().is_some_and(|p| p.jfif);
         s.has_bgra = bgra;
+        s.has_preview = preview.is_some();
         s.sub = Some(sub);
     }
 
@@ -989,6 +1089,9 @@ impl GpuCompositor {
         let s = &self.slots[slot];
         if s.has_bgra {
             s.bgra.unmap();
+        }
+        if let (true, Some((b, ..))) = (s.has_preview, &s.preview) {
+            b.unmap();
         }
         if let Some(t) = &s.ts {
             t.unmap();
@@ -1028,6 +1131,16 @@ impl GpuCompositor {
             // Appending rows avoids zero-filling the whole frame first.
             for y in 0..self.height as usize {
                 out.extend_from_slice(&data[y * self.padded_row as usize..][..row]);
+            }
+        }
+        if let (true, Some((b, pw, ph, prow))) = (s.has_preview, &s.preview) {
+            if let Ok(m) = b.slice(..).get_mapped_range() {
+                let line = *pw as usize * 4;
+                let mut rgba = Vec::with_capacity(line * *ph as usize);
+                for y in 0..*ph as usize {
+                    rgba.extend_from_slice(&m[y * *prow as usize..][..line]);
+                }
+                self.last_preview = Some((*pw, *ph, rgba));
             }
         }
         // Without the BGRA read-back the frame has no CPU pixels (only NV12, if that was asked for).
@@ -1073,7 +1186,139 @@ struct Slot {
     nv12_jfif: bool,
     /// The BGRA picture was copied back for this slot (see `GpuCompositor::want_bgra`).
     has_bgra: bool,
+    /// Read-back buffer for the preview-sized copy (width, height, padded row), and whether this
+    /// slot's submission filled it.
+    preview: Option<(wgpu::Buffer, u32, u32, u32)>,
+    has_preview: bool,
     sub: Option<wgpu::SubmissionIndex>,
+}
+
+/// Draws a downscaled RGBA copy of the canvas for the UI preview: each output pixel averages up to
+/// 4x4 bilinear samples across its footprint (no shimmer from a big reduction), and the bytes come
+/// out in the RGBA order the UI texture wants, so the CPU does nothing but copy rows.
+struct PreviewPass {
+    w: u32,
+    h: u32,
+    tex: wgpu::Texture,
+    view: wgpu::TextureView,
+    pipe: wgpu::RenderPipeline,
+    bind: wgpu::BindGroup,
+}
+
+const PREVIEW_SHADER: &str = r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+struct V { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> V {
+    let x = f32(i & 1u);
+    let y = f32((i >> 1u) & 1u);
+    var o: V;
+    o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+    o.uv = vec2<f32>(x, y);
+    return o;
+}
+@fragment
+fn fs(v: V) -> @location(0) vec4<f32> {
+    let src_size = vec2<f32>(textureDimensions(src));
+    // Output pixel size in source texels, from the screen-space derivative of uv.
+    let step = vec2<f32>(dpdx(v.uv.x), dpdy(v.uv.y)) * src_size;
+    let n = vec2<i32>(clamp(ceil(abs(step)), vec2<f32>(1.0), vec2<f32>(4.0)));
+    var acc = vec4<f32>(0.0);
+    for (var j = 0; j < n.y; j++) {
+        for (var i = 0; i < n.x; i++) {
+            let off = (vec2<f32>(f32(i), f32(j)) + 0.5) / vec2<f32>(n) - 0.5;
+            acc += textureSampleLevel(src, samp, v.uv + off * abs(step) / src_size, 0.0);
+        }
+    }
+    let c = acc / f32(n.x * n.y);
+    return vec4<f32>(c.rgb, 1.0);
+}
+"#;
+
+impl PreviewPass {
+    fn new(device: &wgpu::Device, target: &wgpu::Texture, w: u32, h: u32) -> Self {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("preview"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("preview"), source: wgpu::ShaderSource::Wgsl(PREVIEW_SHADER.into()) });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("preview"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("preview"), bind_group_layouts: &[Some(&layout)], ..Default::default() });
+        let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("preview"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("preview"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&target.create_view(&Default::default())) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+        let view = tex.create_view(&Default::default());
+        Self { w, h, tex, view, pipe, bind }
+    }
+
+    fn encode(&self, enc: &mut wgpu::CommandEncoder, buf: &wgpu::Buffer, row: u32) {
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("preview"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.pipe);
+            pass.set_bind_group(0, &self.bind, &[]);
+            pass.draw(0..4, 0..1);
+        }
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo { texture: &self.tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyBufferInfo { buffer: buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(self.h) } },
+            wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
+        );
+    }
 }
 
 fn map_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {

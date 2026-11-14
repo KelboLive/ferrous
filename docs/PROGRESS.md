@@ -1327,3 +1327,12 @@ which items count as shown, and the grace period.
 - Measured on the user's PC: recording 1440p60 HEVC, encoder 4,976 frames + repeats, 0 skipped; audio and video lengths equal; colour tags BT.709 limited. Over a remote-desktop session CoD ran at ~15 fps and HDR was off, so smoothness and HDR tone-mapping still need a test at the PC.
 - Next: compare against OBS + obs-teleport on the same game; GPU preview (one device for compositor and window); AMF/QSV zero-copy.
 
+
+## Overhead trims: GPU preview, off-thread game search, DX12 window, capture fences
+- **GPU preview** (`gpu.rs` `PreviewPass`): with a preview due, the compositor also draws an RGBA copy at the preview width (aspect kept) with a box filter of up to 4x4 bilinear taps per output pixel, and reads back only that, per pipelined slot. The engine publishes it as the preview directly; the full BGRA read-back is no longer forced for the preview. Lavapipe test: 32x32 blue canvas -> 16x16 RGBA preview of the right colour.
+- **Game search off the render thread**: `GameSource::follow` spawns a short-lived "game search" thread that finds the window and starts its capture; the render thread only polls for the answer. Cause found in the user's log: a recording started while CoD was loading got 2 frames in 23 s (the render loop was blocked reading window titles: `GetWindowText` sends WM_GETTEXT, which waits on a busy window), so FFmpeg never got data and the audio input timed out.
+- **DX12 window**: eframe's adapter selector prefers a discrete DX12 adapter that can present to the window, then Vulkan; logged as "window drawn with ...".
+- **Capture fences**: the GPU ring creates a shared `ID3D11Fence`, signals it after each copy and passes (fence id, handle, value) in `SharedFrame`; the DX12 compositor opens the fence once and stages `add_wait_fence` for the submission that draws the frame. No fence -> the old event-query wait; a fence that can't be opened -> CPU frames.
+- **Measured here** (2-core cloud VM, 1440p JPEG q85): BGRA -> JPEG 4:2:0 18.3 ms/frame, 4:4:4 33.9 ms, GPU-made YCbCr -> JPEG 17.6 ms. The GPU YCbCr path saves read-back (5.5 MB vs 14.7 MB a frame), barely any CPU; 4:4:4 nearly doubles CPU and bytes.
+- **CI**: `per_source_performance_is_measured` waited 4 s while Windows' system monitor deliberately takes its first sample after 5 s; it now waits for the sample (up to 20 s).
+- Not yet run on the user's PC.

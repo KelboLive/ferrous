@@ -4,6 +4,12 @@ Newest first. Each entry lists what changed for users; the detail and test evide
 [`docs/PROGRESS.md`](docs/PROGRESS.md).
 
 ## v0.4 (unreleased)
+- **Lighter preview**: the GPU draws the preview at the window's size, in the window's colour order, and only that small copy comes back to the CPU (about 3.7 MB a frame at 1440p instead of 14.7 MB, with no CPU scaling). Recordings, streams and Links are unaffected.
+- **Game Capture can't stall rendering any more**: looking for the game ran on the render thread and reads window titles, which waits on each window; a game still loading (or hung) froze rendering for many seconds, so a recording started before the game failed with "FFmpeg audio input never opened". The search and the capture start now run on their own thread.
+- **One graphics API fewer**: the Ferrous window draws with DirectX 12 like the compositor (Vulkan was eframe's default), falling back to Vulkan by itself; `WGPU_BACKEND` still overrides.
+- **Capture hands frames over without waiting**: the capture signals a shared fence after each GPU copy and the compositor's GPU waits on it, instead of the capture thread polling for the copy to finish. Devices without shared fences keep the old wait.
+- **Quieter log**: the game-search and UI-rate lines appear every 5 minutes instead of every 15–30 seconds (and losing the game is logged at once).
+- **CI fixed**: the Windows build's only failing test assumed the system monitor sampled within 4 s, but on Windows it waits 5 s after start on purpose; the test now waits for the sample.
 - **Video filters on the GPU**: chroma key, colour correction, scroll, LUTs and the background-removal mask now run as GPU passes in the compositor instead of per-pixel CPU loops, with CPU twins kept as the fallback (tests prove both give the same picture).
 - **GPU-resident capture (experimental, off by default; Settings → Video → GPU capture)**: Windows display, window and game capture can hand each frame to the GPU renderer as a shared texture, skipping the copy to system memory. It falls back to the normal CPU copy by itself for plugin filters, background removal, nested scenes, a different GPU, or any error.
 - **Sharper downscaling**: layers shrunk more than ~1.25:1 (a 4K display capture on a 1080p canvas, a big camera in a corner) are now area-averaged instead of bilinear-sampled, on both the GPU and CPU compositors, so fine lines and text no longer shimmer or vanish. 1:1 and enlarged layers are unchanged and cost nothing extra.

@@ -92,7 +92,7 @@ impl Handler {
     fn publish_gpu(&mut self, frame: &Frame, tex: Option<&ID3D11Texture2D>) -> Result<(), BoxError> {
         let (w, h) = (frame.width(), frame.height());
         if self.ring.as_ref().is_none_or(|r| r.size() != (w, h)) {
-            self.ring = Some(Ring::new(frame.device(), w, h)?);
+            self.ring = Some(Ring::new(frame.device(), frame.device_context(), w, h)?);
         }
         let ring = self.ring.as_mut().expect("ring just made");
         if let Some(f) = ring.publish(frame.device_context(), tex.unwrap_or(frame.as_raw_texture()))? {
@@ -343,6 +343,10 @@ fn find_game(program: &str) -> Option<Window> {
 
 /// Game Capture: finds the game itself and follows it, restarting the
 /// capture when the game closes, restarts or a different one comes up.
+///
+/// The search runs on a helper thread, never on the render thread: reading a window's title sends
+/// that window a message, and a game that is still loading (or hung) doesn't answer for seconds,
+/// which stalled rendering and with it every recording, stream and Link.
 pub struct GameSource {
     program: String,
     cursor: bool,
@@ -350,15 +354,37 @@ pub struct GameSource {
     inner: Option<(WgcSource, u32, String)>,
     last_check: std::time::Instant,
     last_report: Option<std::time::Instant>,
+    /// The search in flight, if any: its answer arrives here.
+    search: Option<crossbeam_channel::Receiver<Found>>,
+}
+
+/// What a search found.
+enum Found {
+    /// No game; with a description of the biggest windows when a report was due.
+    Nothing(Option<String>),
+    /// The same window that is already captured.
+    Same,
+    /// A new game window, its capture already started (or failed to start).
+    Started(anyhow::Result<WgcSource>, u32, String),
 }
 
 impl GameSource {
     pub fn new(program: &str, cursor: bool, fps: u32) -> Self {
-        Self { program: program.to_string(), cursor, fps, inner: None, last_check: std::time::Instant::now() - std::time::Duration::from_secs(10), last_report: None }
+        Self { program: program.to_string(), cursor, fps, inner: None, last_check: std::time::Instant::now() - std::time::Duration::from_secs(10), last_report: None, search: None }
     }
 
-    /// Looks for the game about once a second (cheap, but not every frame).
+    /// Looks for the game about once a second (cheap, but not every frame), without waiting for it.
     fn follow(&mut self) {
+        if let Some(rx) = &self.search {
+            match rx.try_recv() {
+                Ok(found) => {
+                    self.search = None;
+                    self.found(found);
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => return,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => self.search = None,
+            }
+        }
         let dead = self.inner.as_ref().is_some_and(|(s, ..)| !s.is_alive());
         if !dead && self.last_check.elapsed() < std::time::Duration::from_secs(1) {
             return;
@@ -372,26 +398,51 @@ impl GameSource {
         if self.inner.is_some() && !self.program.trim().is_empty() {
             return;
         }
-        let Some(w) = find_game(&self.program) else {
-            // Say why now and then, so "it isn't detecting my game" can be answered from the log.
-            if self.last_report.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(30)) {
-                self.last_report = Some(std::time::Instant::now());
-                if self.program.trim().is_empty() {
-                    log::info!("game capture: no full-screen window found; biggest windows: {}", describe_big_windows());
-                } else {
-                    log::info!("game capture: no window from {} found; biggest windows: {}", self.program, describe_big_windows());
+        // Say why every few minutes, so "it isn't detecting my game" can be answered from the log.
+        let report = self.last_report.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(300));
+        let (program, cursor, fps) = (self.program.clone(), self.cursor, self.fps);
+        let current = self.inner.as_ref().map(|(_, pid, title)| (*pid, title.clone()));
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let spawned = std::thread::Builder::new().name("game search".into()).spawn(move || {
+            let found = match find_game(&program) {
+                None => Found::Nothing(report.then(describe_big_windows)),
+                Some(w) => {
+                    let ident = (w.process_id().unwrap_or(0), w.title().unwrap_or_default());
+                    if current.is_some_and(|c| c == ident) {
+                        Found::Same
+                    } else {
+                        log::info!("game capture: capturing {} \"{}\"", process_name_of(&w).unwrap_or_default(), ident.1.chars().filter(|c| !c.is_control() && !matches!(c, '\u{200b}'..='\u{200f}' | '\u{feff}')).collect::<String>());
+                        Found::Started(WgcSource::start(w, cursor, fps), ident.0, ident.1)
+                    }
+                }
+            };
+            // Nobody waiting any more (the source was removed): the capture just started is dropped.
+            let _ = tx.send(found);
+        });
+        if spawned.is_ok() {
+            self.search = Some(rx);
+        }
+    }
+
+    fn found(&mut self, found: Found) {
+        match found {
+            Found::Nothing(report) => {
+                if let Some(windows) = report {
+                    self.last_report = Some(std::time::Instant::now());
+                    if self.program.trim().is_empty() {
+                        log::info!("game capture: no full-screen window found; biggest windows: {windows}");
+                    } else {
+                        log::info!("game capture: no window from {} found; biggest windows: {windows}", self.program);
+                    }
                 }
             }
-            return;
-        };
-        let ident = (w.process_id().unwrap_or(0), w.title().unwrap_or_default());
-        if self.inner.as_ref().is_some_and(|(_, pid, title)| *pid == ident.0 && *title == ident.1) {
-            return;
-        }
-        log::info!("game capture: capturing {} \"{}\"", process_name_of(&w).unwrap_or_default(), ident.1.chars().filter(|c| !c.is_control() && !matches!(c, '\u{200b}'..='\u{200f}' | '\u{feff}')).collect::<String>());
-        match WgcSource::start(w, self.cursor, self.fps) {
-            Ok(s) => self.inner = Some((s, ident.0, ident.1)),
-            Err(e) => log::warn!("game capture: {e}"),
+            Found::Same => {}
+            Found::Started(Ok(s), pid, title) => {
+                self.inner = Some((s, pid, title));
+                // Losing the game later is reported straight away.
+                self.last_report = None;
+            }
+            Found::Started(Err(e), ..) => log::warn!("game capture: {e}"),
         }
     }
 }
@@ -417,6 +468,8 @@ impl Source for GameSource {
                 self.program = program.clone();
                 self.cursor = *capture_cursor;
                 self.inner = None;
+                // A search for the old settings is forgotten (its capture, if any, is dropped).
+                self.search = None;
                 self.last_check = std::time::Instant::now() - std::time::Duration::from_secs(10);
             }
             return true;

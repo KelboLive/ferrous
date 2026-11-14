@@ -1309,7 +1309,10 @@ fn render_loop(shared: Arc<Shared>, audio: Arc<AudioEngine>, video: ferrous_core
             // next frame counts too.
             let preview_soon = pcfg.enabled && (preview_due || (pipelined_readback && (frame_no + 1).is_multiple_of(divisor)));
             let jpeg_needs_bgra = jpeg_yuv_links && !jfif;
-            compositor.set_bgra(preview_soon || outputs_bgra || links_bgra || jpeg_needs_bgra || transition.is_some() || shared.studio_scene.lock().is_some());
+            // The preview is drawn at its own size on the GPU and read back on its own (a quarter of
+            // the bytes or less, no CPU downscale), so it doesn't need the full picture.
+            compositor.set_preview_width(preview_soon.then_some(pcfg.width));
+            compositor.set_bgra(outputs_bgra || links_bgra || jpeg_needs_bgra || transition.is_some() || shared.studio_scene.lock().is_some());
         }
         compositor.set_pipelined(pipelined_readback && transition.is_none() && shared.studio_scene.lock().is_none() && !shared.links.lock().iter().any(|l| matches!(l.cfg.target, ferrous_core::LinkSourceTarget::Scene { .. })));
         // GPU encoders copy the program picture as it is composed; during a transition the blend is
@@ -1326,6 +1329,8 @@ fn render_loop(shared: Arc<Shared>, audio: Arc<AudioEngine>, video: ferrous_core
         compositor.set_bgra(true);
         compositor.set_nv12(false);
         compositor.set_nv12_jfif(false);
+        compositor.set_preview_width(None);
+        let gpu_preview = compositor.take_preview();
         compositor.set_pipelined(false);
         let canvas = match &mut transition {
             Some(t) => {
@@ -1465,7 +1470,14 @@ fn render_loop(shared: Arc<Shared>, audio: Arc<AudioEngine>, video: ferrous_core
 
         laps.lap(3);
         // Program preview: every rendered frame unless capped.
-        if preview_due && !canvas.data.is_empty() && !same_buffer(&preview_src, &canvas) {
+        if let (true, Some((w, h, rgba)), false) = (preview_due, gpu_preview, in_transition) {
+            serial += 1;
+            *shared.preview.lock() = Some(Arc::new(PreviewFrame { width: w, height: h, rgba, serial }));
+            preview_src = None;
+            if let Some(f) = shared.frame_notify.lock().clone() {
+                f();
+            }
+        } else if preview_due && !canvas.data.is_empty() && !same_buffer(&preview_src, &canvas) {
             preview_src = Some(canvas.data.clone());
             serial += 1;
             previews.submit(PreviewKind::Program, &canvas, pcfg.width, serial);

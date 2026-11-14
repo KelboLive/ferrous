@@ -527,7 +527,7 @@ impl FerrousApp {
         let passes = ctx.cumulative_pass_nr();
         let (t0, p0) = *self.ui_rate.get_or_insert((now, passes));
         let dt = now.duration_since(t0).as_secs_f32();
-        if dt >= 15.0 {
+        if dt >= 300.0 {
             let size = ctx.content_rect().size();
             log::info!(
                 "UI redraws: {:.1}/s; window {:.0}x{:.0} points at {:.2}x; fonts atlas {:?}",

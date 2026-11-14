@@ -46,6 +46,8 @@ pub struct Renderer {
     bgra: bool,
     /// See [`Renderer::set_nv12_jfif`].
     nv12_jfif: bool,
+    /// See [`Renderer::set_preview_width`].
+    preview: Option<u32>,
     /// Inputs of the frame in flight on the GPU, so its result can be
     /// memoised under the right key when it arrives.
     in_flight: Option<Inputs>,
@@ -77,7 +79,7 @@ impl Renderer {
     /// `prefer_gpu = false` forces the CPU path.
     pub fn new(width: u32, height: u32, prefer_gpu: bool) -> (Self, Option<String>) {
         let (backend, err) = Self::backend(width, height, prefer_gpu);
-        (Self { backend, memo: Memo::default(), pool: FramePool::default(), pipelined: false, nv12: false, bgra: true, nv12_jfif: false, in_flight: None }, err)
+        (Self { backend, memo: Memo::default(), pool: FramePool::default(), pipelined: false, nv12: false, bgra: true, nv12_jfif: false, preview: None, in_flight: None }, err)
     }
 
     fn backend(width: u32, height: u32, prefer_gpu: bool) -> (Backend, Option<String>) {
@@ -177,6 +179,20 @@ impl Renderer {
         self.nv12_jfif = on;
     }
 
+    /// GPU path: with the next compositions, also draw an RGBA copy at most `width` wide for the UI
+    /// preview and read back only that (see [`Renderer::take_preview`]). `None` stops it.
+    pub fn set_preview_width(&mut self, width: Option<u32>) {
+        self.preview = width;
+    }
+
+    /// The GPU-made preview of the frame last returned, if one was drawn: (width, height, RGBA).
+    pub fn take_preview(&mut self) -> Option<(u32, u32, Vec<u8>)> {
+        match &mut self.backend {
+            Backend::Gpu(g) => g.take_preview(),
+            Backend::Cpu(_) => None,
+        }
+    }
+
     /// Composes and reports per-layer cost: measured CPU milliseconds on the
     /// CPU path; on the GPU path, the pass's measured GPU time split across
     /// layers by covered area (an estimate, flagged as such). A memo hit
@@ -184,7 +200,8 @@ impl Renderer {
     pub fn compose_timed(&mut self, layers: &[Layer<'_>]) -> Composed {
         // A memoised frame only counts if it has what this frame needs.
         let gpu = matches!(self.backend, Backend::Gpu(_));
-        let (need_bgra, need_nv12) = (self.bgra || !gpu, self.nv12 && gpu);
+        // (A preview from the GPU needs a fresh drawing, or a memoised frame with BGRA to scale.)
+        let (need_bgra, need_nv12) = (self.bgra || !gpu || self.preview.is_some(), self.nv12 && gpu);
         if let Some(frame) = self.memo.get(false, layers).filter(|f| (!need_bgra || !f.data.is_empty()) && (!need_nv12 || (f.nv12.is_some() && f.nv12_jfif == self.nv12_jfif))) {
             return Composed { frame, cpu_ms: vec![0.0; layers.len()], gpu_ms: Vec::new(), gpu_total_ms: None };
         }
@@ -200,6 +217,7 @@ impl Renderer {
                 let (w, h) = g.size();
                 g.set_want_bgra(self.bgra);
                 g.set_nv12_jfif(self.nv12_jfif);
+                g.set_preview_width(self.preview);
                 let (buf, _) = if self.bgra { self.pool.take((w * h * 4) as usize) } else { (Vec::new(), false) };
                 let frame = if self.pipelined {
                     let (frame, is_current) = g.compose_pipelined(layers, buf, self.nv12);
@@ -796,6 +814,15 @@ mod tests {
         r.set_nv12_jfif(false);
         let v = r.compose(&l);
         assert!(!v.nv12_jfif, "a video consumer never gets JPEG's YCbCr from the memo");
+        r.set_bgra(true);
+        // A GPU-made preview: half size, RGBA order, the frame's colour (BGRA 255,0,0 = blue).
+        r.set_bgra(false);
+        r.set_preview_width(Some(16));
+        let _ = r.compose(&[Layer { frame: &VideoFrame::solid(32, 32, [255, 0, 0, 255]), transform: Transform::default(), filters: &[] }]);
+        let (pw, ph, rgba) = r.take_preview().expect("a preview copy");
+        assert_eq!((pw, ph, rgba.len()), (16, 16, 16 * 16 * 4));
+        assert_eq!(&rgba[..4], &[0, 0, 255, 255]);
+        r.set_preview_width(None);
         r.set_bgra(true);
         // Pipelined, alternating (a preview every other frame): every BGRA frame is real.
         r.set_pipelined(true);

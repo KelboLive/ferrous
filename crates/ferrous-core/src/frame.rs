@@ -35,6 +35,20 @@ pub struct SharedFrame {
     pub luid: i64,
     /// Keeps the ring slot from being overwritten while a consumer still holds this frame.
     pub guard: Arc<dyn std::any::Any + Send + Sync>,
+    /// A shared fence the producer signals once its copy into the texture is done: the consumer's
+    /// GPU waits for it, so nobody waits on the CPU. `None`: the copy was finished before handing over.
+    pub fence: Option<SharedFence>,
+}
+
+/// See [`SharedFrame::fence`].
+#[derive(Clone, Copy, Debug)]
+pub struct SharedFence {
+    /// Unique for the fence's lifetime (handles can be reused once closed; this can't).
+    pub id: u64,
+    /// The fence's NT handle, kept open by the frame's guard.
+    pub handle: usize,
+    /// Wait until the fence reaches this.
+    pub value: u64,
 }
 
 impl VideoFrame {

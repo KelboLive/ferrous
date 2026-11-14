@@ -41,7 +41,8 @@ your hardware can produce.** In practice that means:
 | **Filters on the GPU** | Chroma key, colour correction, scroll, LUTs and the background-removal mask run as GPU passes in the compositor (shaders compile the first time you use a filter). CPU twins stay as the fallback and are tested to give the same picture. |
 | **Zero-copy NVIDIA encoding** | Recording, streaming, the replay buffer and Hardware Links of the program picture encode with NVENC inside Ferrous, straight from the canvas texture on the GPU: no picture copied to system memory, no raw frames through a pipe. FFmpeg only muxes and sends. Your rate control, preset, keyframes and B-frames carry over. Settings → Video → *Zero-copy encoding* (on); anything else falls back to the FFmpeg path by itself. |
 | **Only the read-back each frame needs** | The GPU path copies the picture back to the CPU only in the form something will use that frame: NV12 for encoders that take it, JPEG's YCbCr for the JPEG Link, nothing for GPU-encoded outputs, and full BGRA only when the preview is due, a transition runs or the virtual camera is on. |
-| **GPU capture** | Settings → Video → *GPU capture*: display, window and game capture hand each frame to the renderer as a shared texture and skip the copy through system memory. Falls back to the normal path by itself for plugin filters, background removal, nested scenes, a different GPU or any error; the log says when it is in use. |
+| **Light preview** | The GPU draws the preview at the window's size and reads back only that (about a quarter of the bytes at 1440p, no CPU scaling); minimise Ferrous and it costs nothing. |
+| **GPU capture** | Settings → Video → *GPU capture*: display, window and game capture hand each frame to the renderer as a shared texture (synchronised with a shared GPU fence, so neither side waits on the CPU) and skip the copy through system memory. Falls back to the normal path by itself for plugin filters, background removal, nested scenes, a different GPU or any error; the log says when it is in use. |
 | **HDR displays** | On a display in HDR, captures are taken in 16-bit and tone-mapped on the GPU, with Windows' SDR content brightness as white: highlights roll off instead of clipping to flat white. |
 | **Sharper downscaling** | Layers shrunk by more than about 1.25:1 (a 4K display on a 1080p canvas) are area-averaged, so fine lines and text stop shimmering. 1:1 and enlarged layers cost nothing extra. |
 | **A GPU figure you can trust** | The Performance Monitor reads the card's own utilisation (the same counter RTSS shows) instead of Windows' per-engine counters, which can read far too high. |
@@ -157,9 +158,9 @@ The previous to-do list is done (see "README to-do list" in `docs/PROGRESS.md`).
   the D3D12/Vulkan encoders and the OBS host on `obs.dll` all compile for Windows, but haven't run
   on a Windows machine yet.
 - **Measure against OBS on real hardware** (same game, same Link or recording) and close what remains.
-  The biggest known gap is the preview: Ferrous copies the picture to the CPU and uploads it again for its
-  window, where OBS draws its preview on the GPU. Sharing one GPU device between the compositor and the
-  window would remove that.
+  The preview is now drawn at window size on the GPU and only that small copy is read back; drawing it
+  straight from the compositor's texture (one GPU device for compositor and window, as OBS does) would
+  remove the last copy.
 - **Zero-copy encoding for AMD (AMF) and Intel (Quick Sync)**, the same way as NVENC; those cards use the
   FFmpeg path until then.
 - **OBS plugin filters** through the bridge (sources work today).

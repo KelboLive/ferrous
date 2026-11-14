@@ -615,7 +615,16 @@ fn per_source_performance_is_measured() {
     assert!(b.source_ms > 0.01 && b.composite_ms > 0.01);
     let m = &perf[&media];
     assert_eq!(m.pids.len(), 1, "media source reports its FFmpeg process");
-    let sys = engine.system();
+    // On Windows the system monitor takes its first sample only ~5 s after start (it waits out the
+    // GPU's start-up), so wait for it rather than assuming it's there.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let sys = loop {
+        let sys = engine.system();
+        if sys.per_pid.contains_key(&m.pids[0]) && sys.own.cpu > 0.0 || std::time::Instant::now() > deadline {
+            break sys;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
     let p = sys.per_pid.get(&m.pids[0]).expect("helper process sampled");
     println!("ffmpeg decoder: {:.1}% CPU, {} MB", p.cpu, p.mem_bytes / 1_000_000);
     assert!(p.mem_bytes > 0);
