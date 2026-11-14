@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -160,6 +160,38 @@ pub fn encoder_input_size(v: &VideoSettings) -> (u32, u32) {
     ((v.output_width & !1).max(2), (v.output_height & !1).max(2))
 }
 
+/// 0 = not probed (assume supported), 1 = FFmpeg accepts `-thread_queue_size` on inputs, 2 = it doesn't.
+static INPUT_QUEUE_OPT: AtomicU8 = AtomicU8::new(0);
+
+/// Newer FFmpeg builds made `-thread_queue_size` a muxer (output) option and refuse it in front of an
+/// input ("Error opening input files: Invalid argument"). Asks the given FFmpeg once and remembers.
+fn probe_input_queue_option(ffmpeg: &std::path::Path) {
+    if INPUT_QUEUE_OPT.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let ok = ffmpeg::command(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-thread_queue_size", "8", "-f", "lavfi", "-i", "nullsrc=s=16x16:d=0.04", "-f", "null", "-"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        // If FFmpeg can't even be probed, keep the old behaviour; launching it reports the real problem.
+        .unwrap_or(true);
+    INPUT_QUEUE_OPT.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+    if !ok {
+        log::info!("this FFmpeg does not accept -thread_queue_size on inputs; leaving it out");
+    }
+}
+
+fn tqs() -> &'static [&'static str] {
+    if INPUT_QUEUE_OPT.load(Ordering::Relaxed) == 2 {
+        &[]
+    } else {
+        &["-thread_queue_size", "1024"]
+    }
+}
+
 /// Full FFmpeg argument list (without the program name).
 pub fn build_args(cfg: &OutputConfig, audio_ports: &[u16]) -> Vec<String> {
     let v = &cfg.video;
@@ -179,7 +211,7 @@ pub fn build_args(cfg: &OutputConfig, audio_ports: &[u16]) -> Vec<String> {
     if converted {
         let (w, h) = encoder_input_size(v);
         let size = format!("{w}x{h}");
-        push(&["-thread_queue_size", "1024", "-f", "rawvideo", "-pix_fmt", encoder_layout(&cfg.encoder).ffmpeg_pix_fmt()]);
+        push(&[tqs(), &["-f", "rawvideo", "-pix_fmt", encoder_layout(&cfg.encoder).ffmpeg_pix_fmt()]].concat());
         if args::hdr_active(&cfg.encoder) {
             push(&["-color_range", "tv", "-colorspace", "bt2020nc", "-color_primaries", "bt2020", "-color_trc", "smpte2084"]);
         } else {
@@ -188,13 +220,13 @@ pub fn build_args(cfg: &OutputConfig, audio_ports: &[u16]) -> Vec<String> {
         push(&["-video_size", &size, "-framerate", &fps, "-i", "pipe:0"]);
     } else {
         let size = format!("{}x{}", v.base_width, v.base_height);
-        push(&["-thread_queue_size", "1024", "-f", "rawvideo", "-pix_fmt", "bgra"]);
+        push(&[tqs(), &["-f", "rawvideo", "-pix_fmt", "bgra"]].concat());
         push(&["-video_size", &size, "-framerate", &fps, "-i", "pipe:0"]);
     }
     // Inputs 1..: one mixed audio track each.
     for port in audio_ports {
         let audio_url = format!("tcp://127.0.0.1:{port}?listen=1");
-        push(&["-thread_queue_size", "1024", "-f", "f32le", "-ar", "48000", "-ac", "2", "-i", &audio_url]);
+        push(&[tqs(), &["-f", "f32le", "-ar", "48000", "-ac", "2", "-i", &audio_url]].concat());
     }
     push(&["-map", "0:v"]);
     for i in 0..audio_ports.len() {
@@ -294,6 +326,7 @@ impl Output {
             let l = TcpListener::bind("127.0.0.1:0")?;
             ports.push(l.local_addr()?.port());
         }
+        probe_input_queue_option(&cfg.ffmpeg);
         let argv = build_args(&cfg, &ports);
         log::info!("ffmpeg {}", redact(&argv).join(" "));
 
