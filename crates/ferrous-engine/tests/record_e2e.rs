@@ -630,3 +630,73 @@ fn per_source_performance_is_measured() {
     assert!(p.mem_bytes > 0);
     assert!(sys.own.cpu > 0.0);
 }
+
+/// A stream whose connection drops reconnects by itself (off the render thread), and the picture keeps
+/// rendering meanwhile.
+#[test]
+fn dropped_stream_reconnects() {
+    if !have_ffmpeg() {
+        return;
+    }
+    use std::io::Read;
+    let dir = std::env::temp_dir().join("ferrous-e2e-reconnect");
+    let _ = std::fs::remove_dir_all(&dir);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut settings = small_settings(&dir);
+    settings.stream.server = format!("tcp://127.0.0.1:{port}");
+    settings.stream.key = String::new();
+    settings.stream.encoder.encoder = "libx264".into();
+    let mut scenes = SceneCollection::default();
+    scenes.add_item("Bars", SourceConfig::TestPattern { width: 64, height: 64 });
+    let engine = Engine::start(settings, scenes);
+    engine.start_streaming().expect("stream starts");
+    listener.set_nonblocking(false).unwrap();
+    // First connection: read a little, then cut it.
+    let (mut first, _) = listener.accept().expect("FFmpeg connects");
+    let mut buf = [0u8; 4096];
+    let got = first.read(&mut buf).unwrap();
+    assert!(got > 0, "stream data arrives");
+    drop(first);
+    // The engine notices, waits its reconnect delay and connects again.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(listener.accept().map(|(mut s, _)| {
+            let mut b = [0u8; 4096];
+            s.read(&mut b).unwrap_or(0)
+        }));
+    });
+    let again = rx.recv_timeout(Duration::from_secs(30)).expect("reconnected within 30 s").expect("accept");
+    assert!(again > 0, "data after reconnecting");
+    let events = engine.drain_events();
+    assert!(events.iter().any(|e| format!("{e:?}").contains("Reconnecting")), "{events:?}");
+    assert!(engine.status().fps > 10.0, "rendering went on");
+    engine.stop_streaming();
+}
+
+/// Outputs can be started from another thread (the window does this so it never freezes while
+/// FFmpeg comes up), and the result is a normal recording.
+#[test]
+fn recording_starts_from_another_thread() {
+    if !have_ffmpeg() {
+        return;
+    }
+    let dir = std::env::temp_dir().join("ferrous-e2e-control");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut settings = small_settings(&dir);
+    settings.record.encoder.encoder = "libx264".into();
+    let mut scenes = SceneCollection::default();
+    scenes.add_item("Bars", SourceConfig::TestPattern { width: 64, height: 64 });
+    let engine = Engine::start(settings, scenes);
+    let control = engine.control();
+    let path = std::thread::spawn(move || control.start_recording()).join().unwrap().expect("starts");
+    assert!(engine.is_recording());
+    std::thread::sleep(Duration::from_secs(2));
+    engine.stop_recording();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > 0, "a file was written: {}", path.display());
+}

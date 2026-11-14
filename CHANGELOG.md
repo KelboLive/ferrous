@@ -4,6 +4,11 @@ Newest first. Each entry lists what changed for users; the detail and test evide
 [`docs/PROGRESS.md`](docs/PROGRESS.md).
 
 ## v0.4 (unreleased)
+- **Start never freezes the window**: Start Recording, Start Streaming, Go Live and the replay buffer start in the background (FFmpeg and the GPU encoder can take a few seconds), with "Starting…" on the button until they are up.
+- **Sources start off the render thread**: capture, media, devices, browser, images, plugins and Link receivers start on a helper thread and appear when ready, so a slow driver, a hung window or a big file can't hold up rendering (and every recording, stream and Link with it).
+- **Reconnects off the render thread, and zero-copy again**: a dropped stream reconnects on a helper thread without holding up rendering, and the reconnected stream uses zero-copy GPU encoding again (it used to fall back to FFmpeg encoding).
+- **Hardware Links at start-up** get their GPU encoder (they were made before the render thread existed, waited 3 s and fell back to FFmpeg).
+- **CI**: a muxer test passed Windows paths through FFmpeg's tee list, where `:` and `\` mean something else; it now uses plain names.
 - **Lighter preview**: the GPU draws the preview at the window's size, in the window's colour order, and only that small copy comes back to the CPU (about 3.7 MB a frame at 1440p instead of 14.7 MB, with no CPU scaling). Recordings, streams and Links are unaffected.
 - **Game Capture can't stall rendering any more**: looking for the game ran on the render thread and reads window titles, which waits on each window; a game still loading (or hung) froze rendering for many seconds, so a recording started before the game failed with "FFmpeg audio input never opened". The search and the capture start now run on their own thread.
 - **One graphics API fewer**: the Ferrous window draws with DirectX 12 like the compositor (Vulkan was eframe's default), falling back to Vulkan by itself; `WGPU_BACKEND` still overrides.

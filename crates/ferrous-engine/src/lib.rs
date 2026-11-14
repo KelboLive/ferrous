@@ -138,6 +138,25 @@ struct CachedSource {
     acc: (f32, f32, f32, bool),
     /// Since when the source hasn't been needed (not on screen).
     idle_since: Option<Instant>,
+    /// A start running on a helper thread: the settings it was started with, its mixer channel and
+    /// where its result arrives. Dropping this abandons the start (the source is dropped on arrival).
+    starting: Option<PendingStart>,
+}
+
+type StartResult = anyhow::Result<Box<dyn Source>>;
+
+struct PendingStart {
+    config: SourceConfig,
+    channel: Option<Arc<ferrous_audio::AudioChannel>>,
+    rx: crossbeam_channel::Receiver<StartResult>,
+}
+
+/// Sources that start instantly are made on the render thread; everything else (capture, media,
+/// devices, browser, plugins, images to decode, a Link to connect) starts on a helper thread, so a
+/// slow driver, a hung window or a big file can never hold up rendering, and with it every recording,
+/// stream and Link.
+fn starts_instantly(config: &SourceConfig) -> bool {
+    matches!(config, SourceConfig::Color { .. } | SourceConfig::TestPattern { .. } | SourceConfig::Text { .. })
 }
 
 /// How long an unseen source keeps running, so switching back and forth
@@ -193,6 +212,8 @@ struct StreamRetry {
     config: OutputConfig,
     attempts: u32,
     at: Instant,
+    /// A reconnect is running on a helper thread.
+    starting: bool,
 }
 
 struct ExtraStream {
@@ -202,6 +223,8 @@ struct ExtraStream {
     output: Option<Output>,
     attempts: u32,
     retry_at: Option<Instant>,
+    /// A reconnect is running on a helper thread.
+    starting: bool,
 }
 
 /// The virtual camera while it's on: frames go to a worker that converts
@@ -464,9 +487,11 @@ impl Engine {
         });
         let audio = Arc::new(AudioEngine::start(&settings.audio));
         apply_device_audio(&audio, &settings);
-        sync_links(&shared, &audio, &settings);
         shared.sysmon.set_disk_path(&settings.record.folder);
         let render = Some(spawn_render(shared.clone(), audio.clone(), &settings));
+        // After the render thread is up: a Hardware Link asks it for a GPU encoder (before, it waited
+        // 3 s for an answer that couldn't come and fell back to FFmpeg).
+        sync_links(&shared, &audio, &settings);
         Self { shared, audio, render, events: rx, settings }
     }
 
@@ -630,6 +655,67 @@ impl Engine {
         self.shared.vertical_preview.lock().clone()
     }
 
+    /// A handle for starting and stopping outputs from another thread, so the window never waits for
+    /// FFmpeg or the GPU encoder to come up. It uses the settings as they are now.
+    pub fn control(&self) -> Control {
+        Control { shared: self.shared.clone(), audio: self.audio.clone(), settings: self.settings.clone() }
+    }
+
+    pub fn start_recording(&self) -> anyhow::Result<PathBuf> {
+        self.control().start_recording()
+    }
+    pub fn stop_recording(&self) {
+        self.control().stop_recording()
+    }
+    pub fn start_streaming(&self) -> anyhow::Result<()> {
+        self.control().start_streaming()
+    }
+    pub fn start_streaming_with(&self, session_keys: &HashMap<String, (String, String)>) -> anyhow::Result<()> {
+        self.control().start_streaming_with(session_keys)
+    }
+    pub fn start_virtual_camera(&self) -> anyhow::Result<()> {
+        self.control().start_virtual_camera()
+    }
+    pub fn stop_virtual_camera(&self) {
+        self.control().stop_virtual_camera()
+    }
+    pub fn is_virtual_camera_active(&self) -> bool {
+        self.shared.outputs.lock().vcam.is_some()
+    }
+    pub fn virtual_camera_status(&self) -> Option<(bool, u64)> {
+        self.shared.outputs.lock().vcam.as_ref().map(|v| (v.status.connected.load(Ordering::Relaxed), v.status.frames.load(Ordering::Relaxed)))
+    }
+    pub fn is_replay_active(&self) -> bool {
+        self.shared.outputs.lock().replay.is_some()
+    }
+    pub fn start_replay(&self) -> anyhow::Result<()> {
+        self.control().start_replay()
+    }
+    pub fn stop_replay(&self) {
+        self.control().stop_replay()
+    }
+    pub fn save_replay(&self) -> anyhow::Result<PathBuf> {
+        self.control().save_replay()
+    }
+    pub fn stop_streaming(&self) {
+        self.control().stop_streaming()
+    }
+}
+
+/// See [`Engine::control`].
+#[derive(Clone)]
+pub struct Control {
+    shared: Arc<Shared>,
+    audio: Arc<AudioEngine>,
+    settings: Settings,
+}
+
+impl Control {
+    pub fn is_streaming(&self) -> bool {
+        let o = self.shared.outputs.lock();
+        o.stream.is_some() || o.stream_retry.is_some() || !o.extras.is_empty()
+    }
+
     fn ffmpeg(&self) -> PathBuf {
         ferrous_encode::ffmpeg::locate(&self.settings.ffmpeg_path)
     }
@@ -727,7 +813,7 @@ impl Engine {
             };
             let started = if vertical { Output::start(cfg.clone(), subscribe_all(&self.audio, &cfg)) } else { start_output(&self.shared, &self.audio, cfg.clone()) };
             match started {
-                Ok(out) => extras.push(ExtraStream { name: d.name.clone(), vertical, cfg, output: Some(out), attempts: 0, retry_at: None }),
+                Ok(out) => extras.push(ExtraStream { name: d.name.clone(), vertical, cfg, output: Some(out), attempts: 0, retry_at: None, starting: false }),
                 Err(e) => errors.push(format!("{}: {e}", d.name)),
             }
         }
@@ -1980,6 +2066,7 @@ fn sync_sources(cache: &mut HashMap<u64, CachedSource>, scenes: &SceneCollection
             perf: SourcePerf::default(),
             acc: (0.0, 0.0, 0.0, false),
             idle_since: None,
+            starting: None,
         });
         // Sources nobody can see stop after a grace period (and don't start).
         let needed = item.keep_running || shown.contains(&id) || matches!(config, SourceConfig::Scene { .. } | SourceConfig::Clone { .. });
@@ -1991,6 +2078,7 @@ fn sync_sources(cache: &mut HashMap<u64, CachedSource>, scenes: &SceneCollection
             since.elapsed() >= IDLE_GRACE
         };
         if sleeping {
+            entry.starting = None;
             if entry.source.take().is_some() {
                 log::debug!("source {id} ({}) idle, stopped", item.name);
             }
@@ -2003,6 +2091,7 @@ fn sync_sources(cache: &mut HashMap<u64, CachedSource>, scenes: &SceneCollection
             entry.config = config.clone();
             if !updated {
                 entry.source = None;
+                entry.starting = None;
                 entry.last_attempt = Instant::now() - Duration::from_secs(60);
             }
         }
@@ -2013,8 +2102,21 @@ fn sync_sources(cache: &mut HashMap<u64, CachedSource>, scenes: &SceneCollection
         if matches!(config, SourceConfig::Scene { .. } | SourceConfig::Clone { .. }) {
             continue; // composed by the engine itself
         }
+        // A start on a helper thread: take its result once it's there.
+        if let Some(p) = &entry.starting {
+            match p.rx.try_recv() {
+                Ok(res) => {
+                    let p = entry.starting.take().expect("checked above");
+                    if p.config == *config {
+                        finish_start(entry, item, res, p.channel);
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {}
+                Err(crossbeam_channel::TryRecvError::Disconnected) => entry.starting = None,
+            }
+        }
         // Not yet seen: wait to be shown rather than starting it.
-        if entry.source.is_none() && needed && entry.last_attempt.elapsed() >= Duration::from_secs(2) {
+        if entry.source.is_none() && entry.starting.is_none() && needed && entry.last_attempt.elapsed() >= Duration::from_secs(2) {
             entry.last_attempt = Instant::now();
             let has_audio = matches!(
                 config,
@@ -2026,21 +2128,19 @@ fn sync_sources(cache: &mut HashMap<u64, CachedSource>, scenes: &SceneCollection
                 f
             });
             let ctx = ferrous_capture::SourceContext { ffmpeg: env.ffmpeg.clone(), audio: sink, item_id: id, fps: env.fps };
-            match ferrous_capture::create_source(config, &ctx) {
-                Ok(s) => {
-                    entry.source = Some(s);
-                    entry.error = None;
-                    if let Some(ch) = &channel {
-                        ch.set_volume(item.audio_volume);
-                        ch.set_muted(item.audio_muted);
-                    }
-                    entry.audio = channel;
-                }
-                Err(e) => {
-                    if entry.error.as_deref() != Some(&e.to_string()) {
-                        log::warn!("source {id}: {e}");
-                    }
-                    entry.error = Some(e.to_string());
+            if starts_instantly(config) {
+                let res = ferrous_capture::create_source(config, &ctx);
+                finish_start(entry, item, res, channel);
+            } else {
+                let (tx, rx) = crossbeam_channel::bounded::<StartResult>(1);
+                let cfg = config.clone();
+                let spawned = std::thread::Builder::new().name(format!("start source {id}")).spawn(move || {
+                    // Nobody waiting any more: the source is dropped here.
+                    let _ = tx.send(ferrous_capture::create_source(&cfg, &ctx));
+                });
+                match spawned {
+                    Ok(_) => entry.starting = Some(PendingStart { config: config.clone(), channel, rx }),
+                    Err(e) => finish_start(entry, item, Err(e.into()), channel),
                 }
             }
         }
@@ -2056,95 +2156,163 @@ fn sync_sources(cache: &mut HashMap<u64, CachedSource>, scenes: &SceneCollection
     }
 }
 
-fn supervise(shared: &Shared, audio: &AudioEngine) {
-    let mut o = shared.outputs.lock();
-    // Extra destinations: report drops and reconnect (up to MAX_RECONNECTS).
-    for e in o.extras.iter_mut() {
-        if e.output.as_ref().is_some_and(|out| !out.is_running()) {
-            let out = e.output.take().unwrap();
-            let err = out.stats.error().unwrap_or_else(|| "connection closed".into());
-            let _ = shared.events.try_send(EngineEvent::Error(format!("{} disconnected: {err}", e.name)));
-            e.retry_at = Some(Instant::now() + RECONNECT_DELAY);
+/// Puts a newly started source (or its error) in place.
+fn finish_start(entry: &mut CachedSource, item: &ferrous_core::SceneItem, res: StartResult, channel: Option<Arc<ferrous_audio::AudioChannel>>) {
+    match res {
+        Ok(s) => {
+            entry.source = Some(s);
+            entry.error = None;
+            if let Some(ch) = &channel {
+                ch.set_volume(item.audio_volume);
+                ch.set_muted(item.audio_muted);
+            }
+            entry.audio = channel;
         }
-        if e.output.is_none() && e.retry_at.is_some_and(|t| Instant::now() >= t) {
-            e.attempts += 1;
-            match Output::start(e.cfg.clone(), subscribe_all(audio, &e.cfg)) {
+        Err(e) => {
+            if entry.error.as_deref() != Some(&e.to_string()) {
+                log::warn!("source {}: {e}", item.id);
+            }
+            entry.error = Some(e.to_string());
+        }
+    }
+}
+
+/// Notices outputs that stopped and schedules reconnects. Runs on the render thread, so it only looks
+/// at state: starting FFmpeg (and, for zero-copy, asking this very thread for a GPU encoder) happens on
+/// a helper thread, and the outputs lock is never held while something starts.
+fn supervise(shared: &Arc<Shared>, audio: &Arc<AudioEngine>) {
+    let mut starts: Vec<Restart> = Vec::new();
+    {
+        let mut o = shared.outputs.lock();
+        // Extra destinations: report drops and reconnect (up to MAX_RECONNECTS).
+        for e in o.extras.iter_mut() {
+            if e.output.as_ref().is_some_and(|out| !out.is_running()) {
+                let out = e.output.take().unwrap();
+                let err = out.stats.error().unwrap_or_else(|| "connection closed".into());
+                let _ = shared.events.try_send(EngineEvent::Error(format!("{} disconnected: {err}", e.name)));
+                e.retry_at = Some(Instant::now() + RECONNECT_DELAY);
+            }
+            if e.output.is_none() && !e.starting && e.retry_at.is_some_and(|t| Instant::now() >= t) {
+                e.attempts += 1;
+                e.starting = true;
+                starts.push(Restart::Extra { name: e.name.clone(), vertical: e.vertical, cfg: e.cfg.clone(), attempt: e.attempts });
+            }
+        }
+        o.extras.retain(|e| e.output.is_some() || e.retry_at.is_some() || e.starting);
+        if o.replay.as_ref().is_some_and(|(r, _)| !r.is_running()) {
+            let (r, _) = o.replay.take().unwrap();
+            let err = r.stats.error().unwrap_or_else(|| "FFmpeg exited".into());
+            let _ = shared.events.try_send(EngineEvent::Error(format!("Replay buffer stopped: {err}")));
+        }
+        if let Some(rec) = &o.record {
+            if !rec.is_running() {
+                let err = rec.stats.error().unwrap_or_else(|| "FFmpeg exited".into());
+                let _ = shared.events.try_send(EngineEvent::Error(format!("Recording stopped: {err}")));
+                o.record = None;
+                o.record_path = None;
+            }
+        }
+        if let Some(stream) = &o.stream {
+            if !stream.is_running() {
+                let err = stream.stats.error().unwrap_or_else(|| "connection closed".into());
+                let _ = shared.events.try_send(EngineEvent::Error(format!("Stream disconnected: {err}")));
+                o.stream = None;
+                let cfg = shared.stream_config.lock().clone();
+                match (cfg, o.stream_retry.as_mut()) {
+                    // Died again during a reconnect's probation: keep counting.
+                    (Some(_), Some(r)) => r.at = Instant::now() + RECONNECT_DELAY,
+                    (Some(config), None) => o.stream_retry = Some(StreamRetry { config, attempts: 0, at: Instant::now() + RECONNECT_DELAY, starting: false }),
+                    (None, _) => o.stream_retry = None,
+                }
+            }
+        }
+        if o.stream.is_none() {
+            if let Some(retry) = o.stream_retry.as_mut() {
+                if !retry.starting && Instant::now() >= retry.at {
+                    retry.attempts += 1;
+                    retry.starting = true;
+                    starts.push(Restart::Stream { cfg: retry.config.clone(), attempt: retry.attempts });
+                }
+            }
+        } else if let Some(r) = &o.stream_retry {
+            // Reconnected stream has been stable past its probation window.
+            if !r.starting && Instant::now() >= r.at {
+                o.stream_retry = None;
+                let _ = shared.events.try_send(EngineEvent::Info("Stream reconnected".into()));
+            }
+        }
+    }
+    if starts.is_empty() {
+        return;
+    }
+    let (shared, audio) = (shared.clone(), audio.clone());
+    let spawned = thread::Builder::new().name("reconnect".into()).spawn(move || {
+        for s in starts {
+            restart(&shared, &audio, s);
+        }
+    });
+    if let Err(e) = spawned {
+        log::warn!("reconnect thread: {e}");
+    }
+}
+
+/// A reconnect to run off the render thread (see [`supervise`]).
+enum Restart {
+    Stream { cfg: OutputConfig, attempt: u32 },
+    Extra { name: String, vertical: bool, cfg: OutputConfig, attempt: u32 },
+}
+
+fn restart(shared: &Shared, audio: &AudioEngine, r: Restart) {
+    match r {
+        Restart::Stream { cfg, attempt } => {
+            // The usual start, zero-copy GPU encoding included (it used to fall back to FFmpeg here).
+            let started = start_output(shared, audio, cfg);
+            let mut o = shared.outputs.lock();
+            let Some(retry) = o.stream_retry.as_mut() else {
+                return; // stopped meanwhile: a new output is dropped here
+            };
+            retry.starting = false;
+            match started {
+                Ok(out) if o.stream.is_none() => {
+                    let _ = shared.events.try_send(EngineEvent::Info(format!("Reconnecting (attempt {attempt})…")));
+                    o.stream = Some(out);
+                    // Stay in retry mode until it has survived a while.
+                    if let Some(r) = o.stream_retry.as_mut() {
+                        r.at = Instant::now() + Duration::from_secs(30);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let _ = shared.events.try_send(EngineEvent::Error(format!("Reconnect failed: {e}")));
+                    if let Some(r) = o.stream_retry.as_mut() {
+                        r.at = Instant::now() + RECONNECT_DELAY;
+                    }
+                }
+            }
+            if attempt >= MAX_RECONNECTS && o.stream.is_none() {
+                o.stream_retry = None;
+                let _ = shared.events.try_send(EngineEvent::Error("Gave up reconnecting".into()));
+            }
+        }
+        Restart::Extra { name, vertical, cfg, attempt } => {
+            let started = if vertical { Output::start(cfg.clone(), subscribe_all(audio, &cfg)) } else { start_output(shared, audio, cfg) };
+            let mut o = shared.outputs.lock();
+            let Some(e) = o.extras.iter_mut().find(|e| e.name == name && e.starting) else {
+                return; // stopped meanwhile
+            };
+            e.starting = false;
+            match started {
                 Ok(out) => {
                     e.output = Some(out);
                     e.retry_at = None;
-                    let _ = shared.events.try_send(EngineEvent::Info(format!("{}: reconnecting (attempt {})…", e.name, e.attempts)));
+                    let _ = shared.events.try_send(EngineEvent::Info(format!("{name}: reconnecting (attempt {attempt})…")));
                 }
-                Err(_) if e.attempts < MAX_RECONNECTS => e.retry_at = Some(Instant::now() + RECONNECT_DELAY),
+                Err(_) if attempt < MAX_RECONNECTS => e.retry_at = Some(Instant::now() + RECONNECT_DELAY),
                 Err(err) => {
                     e.retry_at = None;
-                    let _ = shared.events.try_send(EngineEvent::Error(format!("{}: gave up reconnecting: {err}", e.name)));
+                    let _ = shared.events.try_send(EngineEvent::Error(format!("{name}: gave up reconnecting: {err}")));
                 }
             }
-        }
-    }
-    o.extras.retain(|e| e.output.is_some() || e.retry_at.is_some());
-    if o.replay.as_ref().is_some_and(|(r, _)| !r.is_running()) {
-        let (r, _) = o.replay.take().unwrap();
-        let err = r.stats.error().unwrap_or_else(|| "FFmpeg exited".into());
-        let _ = shared.events.try_send(EngineEvent::Error(format!("Replay buffer stopped: {err}")));
-    }
-    if let Some(rec) = &o.record {
-        if !rec.is_running() {
-            let err = rec.stats.error().unwrap_or_else(|| "FFmpeg exited".into());
-            let _ = shared.events.try_send(EngineEvent::Error(format!("Recording stopped: {err}")));
-            o.record = None;
-            o.record_path = None;
-        }
-    }
-    if let Some(stream) = &o.stream {
-        if !stream.is_running() {
-            let err = stream.stats.error().unwrap_or_else(|| "connection closed".into());
-            let _ = shared.events.try_send(EngineEvent::Error(format!("Stream disconnected: {err}")));
-            o.stream = None;
-            let cfg = shared.stream_config.lock().clone();
-            match (cfg, o.stream_retry.as_mut()) {
-                // Died again during a reconnect's probation: keep counting.
-                (Some(_), Some(r)) => r.at = Instant::now() + RECONNECT_DELAY,
-                (Some(config), None) => {
-                    o.stream_retry =
-                        Some(StreamRetry { config, attempts: 0, at: Instant::now() + RECONNECT_DELAY })
-                }
-                (None, _) => o.stream_retry = None,
-            }
-        }
-    }
-    if o.stream.is_none() {
-        if let Some(retry) = o.stream_retry.as_mut() {
-            if Instant::now() >= retry.at {
-                retry.attempts += 1;
-                let n = retry.attempts;
-                match Output::start(retry.config.clone(), subscribe_all(audio, &retry.config)) {
-                    Ok(out) => {
-                        let _ = shared.events.try_send(EngineEvent::Info(format!("Reconnecting (attempt {n})…")));
-                        o.stream = Some(out);
-                        // Stay in retry mode until it has survived a while.
-                        if let Some(r) = o.stream_retry.as_mut() {
-                            r.at = Instant::now() + Duration::from_secs(30);
-                        }
-                    }
-                    Err(e) => {
-                        let _ = shared.events.try_send(EngineEvent::Error(format!("Reconnect failed: {e}")));
-                        if let Some(r) = o.stream_retry.as_mut() {
-                            r.at = Instant::now() + RECONNECT_DELAY;
-                        }
-                    }
-                }
-                if n >= MAX_RECONNECTS && o.stream.is_none() {
-                    o.stream_retry = None;
-                    let _ = shared.events.try_send(EngineEvent::Error("Gave up reconnecting".into()));
-                }
-            }
-        }
-    } else if let Some(r) = &o.stream_retry {
-        // Reconnected stream has been stable past its probation window.
-        if Instant::now() >= r.at {
-            o.stream_retry = None;
-            let _ = shared.events.try_send(EngineEvent::Info("Stream reconnected".into()));
         }
     }
 }
@@ -2267,6 +2435,41 @@ mod idle_tests {
         assert_eq!((f.width, f.height), (64, 36));
         assert!(item_frame(&mut cache, &item(again)).is_none(), "a clone of a clone shows nothing");
         assert!(item_frame(&mut cache, &item(me)).is_none(), "a self-clone shows nothing");
+    }
+
+    /// Slow sources start on a helper thread: the render thread's pass returns at once and a later
+    /// pass picks up the result (here an error), and a start abandoned by a settings change is ignored.
+    #[test]
+    fn slow_sources_start_off_the_render_thread() {
+        let mut c = SceneCollection::default();
+        let id = c.add_item_to(0, "pic", SourceConfig::Image { path: "/no/such/picture.png".into() });
+        let env = SourceEnv { fps: 60, ffmpeg: PathBuf::from("ffmpeg"), mixer: Arc::new(Mixer::default()) };
+        let mut cache = HashMap::new();
+        let shown = shown_items(&c, 0, None, None, &[]);
+        sync_sources(&mut cache, &c, &env, &shown);
+        assert!(cache[&id].starting.is_some(), "started on a helper thread");
+        assert!(cache[&id].error.is_none(), "no result yet on the render thread");
+        let mut done = false;
+        for _ in 0..200 {
+            std::thread::sleep(Duration::from_millis(10));
+            sync_sources(&mut cache, &c, &env, &shown);
+            if cache[&id].error.is_some() {
+                done = true;
+                break;
+            }
+        }
+        assert!(done, "the start's result arrives on a later pass");
+        assert!(cache[&id].starting.is_none() && cache[&id].source.is_none());
+
+        // New settings while a start runs: that start is dropped and the new one goes ahead at once.
+        let mut c2 = c.clone();
+        cache.get_mut(&id).unwrap().last_attempt = Instant::now() - Duration::from_secs(60);
+        sync_sources(&mut cache, &c2, &env, &shown);
+        assert!(cache[&id].starting.is_some());
+        c2.scenes[0].items.iter_mut().find(|i| i.id == id).unwrap().source = SourceConfig::Image { path: "/another/missing.png".into() };
+        sync_sources(&mut cache, &c2, &env, &shown);
+        let p = cache[&id].starting.as_ref().expect("restarted with the new settings");
+        assert!(matches!(&p.config, SourceConfig::Image { path } if path.to_string_lossy().contains("another")));
     }
 
     #[test]

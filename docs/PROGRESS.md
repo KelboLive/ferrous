@@ -1336,3 +1336,10 @@ which items count as shown, and the grace period.
 - **Measured here** (2-core cloud VM, 1440p JPEG q85): BGRA -> JPEG 4:2:0 18.3 ms/frame, 4:4:4 33.9 ms, GPU-made YCbCr -> JPEG 17.6 ms. The GPU YCbCr path saves read-back (5.5 MB vs 14.7 MB a frame), barely any CPU; 4:4:4 nearly doubles CPU and bytes.
 - **CI**: `per_source_performance_is_measured` waited 4 s while Windows' system monitor deliberately takes its first sample after 5 s; it now waits for the sample (up to 20 s).
 - Not yet run on the user's PC.
+
+## Nothing slow on the render thread or the window thread
+- **Source starts** (`sync_sources`): sources other than colour, test pattern and text are created on a "start source" thread; the render pass polls for the result (`CachedSource::starting`), ignores a start made with settings that have since changed, and abandons it when the source goes idle. Test: an image source's result arrives on a later pass; a settings change mid-start restarts with the new settings.
+- **Supervisor** (`supervise`): the render thread only inspects output state; reconnects (main stream and extra destinations) run on a "reconnect" thread through `start_output`, so they get zero-copy NVENC (the render thread serves the encoder request instead of waiting on itself), and the outputs lock is not held while FFmpeg starts. Test: a TCP stream target that drops the connection gets a second connection with data, and rendering continues.
+- **Links** are synced after the render thread starts.
+- **Window**: `Engine::control()` returns a cloneable handle (shared state, audio engine, settings); the app starts record/stream/replay through it on a helper thread and shows the result as a toast; buttons read "Starting…" meanwhile and repeated presses are ignored. Test: a recording started from another thread writes a file.
+- **CI fix**: `b_frames_keep_their_timing` ran FFmpeg's tee muxer with absolute Windows paths; it now runs in the temp folder with relative names.

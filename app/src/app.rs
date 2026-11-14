@@ -118,6 +118,14 @@ enum Rename {
     Item(u64, String),
 }
 
+/// See `FerrousApp::starting`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartKind {
+    Record,
+    Stream,
+    Replay,
+}
+
 pub struct FerrousApp {
     pub(crate) engine: Engine,
     pub(crate) settings: Settings,
@@ -189,6 +197,9 @@ pub struct FerrousApp {
     vertical_serial: u64,
     /// Go-live prompt for destinations needing this session's server/key.
     session_prompt: Option<Vec<(String, String, String)>>,
+    /// Starts running on a helper thread (FFmpeg and the GPU encoder can take a few seconds to come
+    /// up, and the window shouldn't freeze meanwhile): what is starting and where its message arrives.
+    starting: Vec<(StartKind, std::sync::mpsc::Receiver<(String, bool)>)>,
     palette: crate::palette::Palette,
     /// The pre-flight window: what was about to start, and what was found.
     preflight: Option<(crate::preflight::Kind, Vec<crate::preflight::Check>)>,
@@ -274,6 +285,7 @@ impl FerrousApp {
             vertical_tex: None,
             vertical_serial: 0,
             session_prompt: None,
+            starting: Vec::new(),
             palette: Default::default(),
             preflight: None,
             tour_step: 0,
@@ -394,6 +406,7 @@ impl FerrousApp {
     fn tick(&mut self, ctx: &egui::Context) {
         self.sync_preview_config(ctx);
         self.persist_mixer_state();
+        self.poll_starts();
         for ev in self.engine.drain_events() {
             match ev {
                 EngineEvent::Info(m) => self.toast(m, false),
@@ -1503,10 +1516,10 @@ impl FerrousApp {
             let keys: std::collections::HashMap<String, (String, String)> =
                 entries.iter().map(|(n, s, k)| (n.clone(), (s.trim().to_string(), k.trim().to_string()))).collect();
             self.session_prompt = None;
-            match self.engine.start_streaming_with(&keys) {
-                Ok(()) => self.toast("Going live…", false),
-                Err(e) => self.toast(format!("Couldn't start stream: {e}"), true),
-            }
+            self.start_in_background(StartKind::Stream, move |c| match c.start_streaming_with(&keys) {
+                Ok(()) => ("Going live…".into(), false),
+                Err(e) => (format!("Couldn't start stream: {e}"), true),
+            });
         } else if cancel {
             self.session_prompt = None;
         }
@@ -1597,11 +1610,47 @@ impl FerrousApp {
         }
     }
 
+    /// Starts an output on a helper thread; its message is shown when it's done (see `poll_starts`).
+    fn start_in_background(&mut self, kind: StartKind, start: impl FnOnce(ferrous_engine::Control) -> (String, bool) + Send + 'static) {
+        let control = self.engine.control();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name(format!("start {kind:?}")).spawn(move || {
+            let _ = tx.send(start(control));
+        });
+        match spawned {
+            Ok(_) => self.starting.push((kind, rx)),
+            Err(e) => self.toast(format!("Couldn't start: {e}"), true),
+        }
+    }
+
+    fn is_starting(&self, kind: StartKind) -> bool {
+        self.starting.iter().any(|(k, _)| *k == kind)
+    }
+
+    fn poll_starts(&mut self) {
+        let mut done = Vec::new();
+        self.starting.retain(|(_, rx)| match rx.try_recv() {
+            Ok(msg) => {
+                done.push(msg);
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        });
+        for (msg, error) in done {
+            if !msg.is_empty() {
+                self.toast(msg, error);
+            }
+        }
+    }
+
     /// Runs an action from a button, hotkey or the remote API.
     pub fn perform(&mut self, action: HotkeyAction) {
         match action {
             HotkeyAction::ToggleStreaming => {
-                if self.engine.is_streaming() {
+                if self.is_starting(StartKind::Stream) {
+                    // Already on its way.
+                } else if self.engine.is_streaming() {
                     self.engine.stop_streaming();
                 } else if self.settings.destinations.iter().any(|d| d.enabled && d.ask_each_time) {
                     self.session_prompt = Some(
@@ -1611,27 +1660,35 @@ impl FerrousApp {
                 } else if self.settings.stream.key.trim().is_empty() && self.settings.stream.server.starts_with("rtmp") {
                     self.toast("Add your stream key in Settings > Stream first.", true);
                     self.settings_win.open_with(&self.settings, &self.scenes);
-                } else if let Err(e) = self.engine.start_streaming() {
-                    self.toast(format!("Couldn't start stream: {e}"), true);
                 } else {
-                    self.toast("Stream starting…", false);
+                    self.start_in_background(StartKind::Stream, |c| match c.start_streaming() {
+                        Ok(()) => ("Stream starting…".into(), false),
+                        Err(e) => (format!("Couldn't start stream: {e}"), true),
+                    });
                 }
             }
             HotkeyAction::ToggleRecording => {
-                if self.engine.is_recording() {
+                if self.is_starting(StartKind::Record) {
+                    // Already on its way.
+                } else if self.engine.is_recording() {
                     self.engine.stop_recording();
                 } else {
-                    match self.engine.start_recording() {
-                        Ok(p) => self.toast(format!("Recording to {}", p.display()), false),
-                        Err(e) => self.toast(format!("Couldn't start recording: {e}"), true),
-                    }
+                    self.start_in_background(StartKind::Record, |c| match c.start_recording() {
+                        Ok(p) => (format!("Recording to {}", p.display()), false),
+                        Err(e) => (format!("Couldn't start recording: {e}"), true),
+                    });
                 }
             }
             HotkeyAction::ToggleReplayBuffer => {
-                if self.engine.is_replay_active() {
+                if self.is_starting(StartKind::Replay) {
+                    // Already on its way.
+                } else if self.engine.is_replay_active() {
                     self.engine.stop_replay();
-                } else if let Err(e) = self.engine.start_replay() {
-                    self.toast(format!("Couldn't start replay buffer: {e}"), true);
+                } else {
+                    self.start_in_background(StartKind::Replay, |c| match c.start_replay() {
+                        Ok(()) => (String::new(), false),
+                        Err(e) => (format!("Couldn't start replay buffer: {e}"), true),
+                    });
                 }
             }
             HotkeyAction::SaveReplay => {
@@ -1817,11 +1874,13 @@ impl FerrousApp {
             ui.set_width(ui.available_width());
             widgets::dock_title(ui, "Controls");
             let streaming = self.engine.is_streaming();
-            if widgets::action_button(ui, if streaming { "Stop Streaming" } else { "Start Streaming" }, streaming).clicked() {
+            let label = if self.is_starting(StartKind::Stream) { "Starting…" } else if streaming { "Stop Streaming" } else { "Start Streaming" };
+            if widgets::action_button(ui, label, streaming).clicked() {
                 self.request_start(crate::preflight::Kind::Stream);
             }
             let recording = self.engine.is_recording();
-            if widgets::action_button(ui, if recording { "Stop Recording" } else { "Start Recording" }, recording).clicked() {
+            let label = if self.is_starting(StartKind::Record) { "Starting…" } else if recording { "Stop Recording" } else { "Start Recording" };
+            if widgets::action_button(ui, label, recording).clicked() {
                 self.request_start(crate::preflight::Kind::Record);
             }
             self.replay_and_vcam(ui);
@@ -1845,6 +1904,7 @@ impl FerrousApp {
     /// The Simple layout's controls: two big buttons and little else.
     fn simple_controls(&mut self, ui: &mut egui::Ui) {
         use crate::preflight::Kind as Start;
+        use StartKind as Start2;
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             widgets::dock_title(ui, "Controls");
@@ -1853,7 +1913,8 @@ impl FerrousApp {
                 ui.add_sized([ui.available_width(), 52.0], egui::Button::new(RichText::new(text).size(18.0).strong().color(Color32::WHITE)).fill(base).corner_radius(10))
             };
             let recording = self.engine.is_recording();
-            if big(ui, if recording { "■  Stop Recording" } else { "●  Start Recording" }, recording).on_hover_text("Saves a video of what's in the preview.").clicked() {
+            let label = if self.is_starting(Start2::Record) { "…  Starting" } else if recording { "■  Stop Recording" } else { "●  Start Recording" };
+            if big(ui, label, recording).on_hover_text("Saves a video of what's in the preview.").clicked() {
                 self.request_start(Start::Record);
             }
             let st = self.engine.status();
@@ -1861,7 +1922,8 @@ impl FerrousApp {
             ui.label(RichText::new(hint).small().color(theme::muted()));
             ui.add_space(6.0);
             let streaming = self.engine.is_streaming();
-            if big(ui, if streaming { "■  Stop Streaming" } else { "📡  Go Live" }, streaming).on_hover_text("Streams the preview to your streaming service.").clicked() {
+            let label = if self.is_starting(Start2::Stream) { "…  Starting" } else if streaming { "■  Stop Streaming" } else { "📡  Go Live" };
+            if big(ui, label, streaming).on_hover_text("Streams the preview to your streaming service.").clicked() {
                 self.request_start(Start::Stream);
             }
             let hint = if streaming { format!("Live… {}", fmt_duration(st.streaming.elapsed)) } else { format!("To {}", self.settings.stream.service) };
@@ -1886,7 +1948,7 @@ impl FerrousApp {
         let replay = self.engine.is_replay_active();
         // Side by side when both labels fit, stacked full-width when the
         // dock is narrow (a fixed minimum width ran past the dock edge).
-        let label = if replay { "Stop Replay Buffer" } else { "Start Replay Buffer" };
+        let label = if self.is_starting(StartKind::Replay) { "Starting…" } else if replay { "Stop Replay Buffer" } else { "Start Replay Buffer" };
         let (mut toggle, mut save) = (false, false);
         let full = ui.available_width();
         if full >= 300.0 {
@@ -3171,6 +3233,9 @@ impl FerrousApp {
             Kind::Record => (self.engine.is_recording(), HotkeyAction::ToggleRecording),
             Kind::Stream => (self.engine.is_streaming(), HotkeyAction::ToggleStreaming),
         };
+        if self.is_starting(if kind == Kind::Record { StartKind::Record } else { StartKind::Stream }) {
+            return; // already on its way
+        }
         if active || !self.settings.ui.preflight {
             self.perform(action);
             return;

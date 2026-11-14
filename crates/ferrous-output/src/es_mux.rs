@@ -267,9 +267,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("esmux-b-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let (es, mkv) = (dir.join("v.h264"), dir.join("ref.ts"));
-        let tee = format!("[f=h264]{}|[f=mpegts]{}", es.display(), mkv.display());
+        // Plain names, run inside the folder: a Windows path's `:` and `\` mean something else in a tee list.
+        let tee = "[f=h264]v.h264|[f=mpegts]ref.ts";
         let ok = Command::new("ffmpeg")
-            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x180:r=30:d=2", "-c:v", "libx264", "-bf", "2", "-x264-params", "aud=1", "-map", "0", "-f", "tee", &tee])
+            .current_dir(&dir)
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x180:r=30:d=2", "-c:v", "libx264", "-bf", "2", "-x264-params", "aud=1", "-map", "0", "-f", "tee", tee])
             .stderr(Stdio::null())
             .status()
             .is_ok_and(|s| s.success());
